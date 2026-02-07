@@ -1,17 +1,20 @@
 """
-Animated Gooey QR Code GIF Generator (v7)
+Animated Gooey QR Code GIF Generator (v8)
 
 Reads a URL from url.txt, generates 3 visually distinct QR code variants
 (all with rounded eyes), morphs between them with a gooey transition,
 overlays a spinning 3D pixel-art-style coin with halftone portrait in
 the centre, and writes a looping animated GIF.
 
-Key changes in v7:
-  - Uses pixel-art-coin.jpg reference for the 3D coin shell (rim, edge, depth)
-  - Coin has real 3D depth: visible edge layers during rotation
-  - Centre blank radius is more generous to avoid QR module artifacts
-  - Spin is truly continuous with smooth direction reversal per variant
-  - Halftone portrait quality preserved from v6
+Key changes in v8:
+  - Proper slab-based 3D coin rendering with correct z-ordering:
+      * Thickness slab behind/in-front based on sin(angle)
+      * Face disc squished by cos(angle)
+      * Pixel-art rim overlay composited on top
+  - Halftone portrait clipped to inner face area (~65% of coin radius)
+  - QR border thickness dynamically matches finder-pattern eye width (~1 module)
+  - COIN_EDGE_LAYERS removed; replaced by single COIN_THICKNESS slab
+  - Pixel-art reference parsed into rim ring and inner face boundary
 """
 
 from __future__ import annotations
@@ -40,7 +43,7 @@ OUTPUT_PATH = pathlib.Path("output/qr_animated.gif")
 QR_SIZE = 560                  # QR code render size (px)
 CANVAS_SIZE = 600              # full output frame
 BORDER_PAD = 4                 # gap between outermost QR modules and border
-BORDER_WIDTH = 2               # border line thickness
+BORDER_WIDTH = 2               # default; overridden dynamically in main()
 
 HOLD_DURATION_MS = 4000
 HOLD_SUBFRAME_MS = 80          # sub-frame interval during hold (coin spin)
@@ -55,7 +58,7 @@ COIN_RATIO = 0.34              # token diameter relative to QR_SIZE
 COIN_SPIN_PERIOD_MS = 5000     # 5 seconds per full rotation (slower)
 COIN_ROTATION_STEPS = 60       # pre-rendered frames in one full spin
 COIN_CLEAR_BLOCK = 20          # clearance zone block size (px)
-COIN_EDGE_LAYERS = 6           # number of edge layers for 3D depth
+# (COIN_EDGE_LAYERS removed — replaced by slab-based 3D rendering)
 
 # How many QR modules (radius) to blank in the centre for the token.
 CENTER_BLANK_EXTRA = 2         # extra modules beyond the token edge
@@ -190,8 +193,20 @@ def colorize_qr(mask: Image.Image, fg: tuple[int, ...]) -> Image.Image:
     return Image.fromarray(rgba, "RGBA")
 
 
-def compose_frame(mask: Image.Image, fg: tuple[int, ...]) -> Image.Image:
-    """White canvas + coloured QR modules + tight square border."""
+def compose_frame(
+    mask: Image.Image,
+    fg: tuple[int, ...],
+    border_width: int = BORDER_WIDTH,
+) -> Image.Image:
+    """White canvas + coloured QR modules + tight square border.
+
+    Parameters
+    ----------
+    border_width : int
+        Thickness of the outer border rectangle (in pixels).  When computed
+        dynamically this matches ~1 QR module width so the border visually
+        aligns with the finder-pattern eye outlines.
+    """
     base = Image.new("RGBA", (CANVAS_SIZE, CANVAS_SIZE), (255, 255, 255, 255))
 
     qr = colorize_qr(mask, fg)
@@ -204,7 +219,7 @@ def compose_frame(mask: Image.Image, fg: tuple[int, ...]) -> Image.Image:
     draw.rectangle(
         [b, b, CANVAS_SIZE - b - 1, CANVAS_SIZE - b - 1],
         outline=(*fg, 255),
-        width=BORDER_WIDTH,
+        width=border_width,
     )
     return base
 
@@ -243,6 +258,7 @@ def render_halftone_token(
     brightness: np.ndarray,
     display_size: int,
     fg_color: tuple[int, int, int],
+    inner_radius_ratio: float = 1.0,
 ) -> Image.Image:
     """
     Render the portrait as a halftone-style mosaic inside a circle.
@@ -251,6 +267,13 @@ def render_halftone_token(
     proportional to the darkness of that cell. Dark cells -> large filled
     squares, light cells -> small or no squares. This produces a bold,
     stylised portrait that reads well even at small sizes.
+
+    Parameters
+    ----------
+    inner_radius_ratio : float
+        Fraction of the full coin diameter used for the portrait circle.
+        1.0 = fill entire coin (legacy behaviour).
+        ~0.65 = confine portrait to the inner face, leaving space for the rim.
 
     Returns RGBA at display_size x display_size.
     """
@@ -284,10 +307,18 @@ def render_halftone_token(
     # Downsample to display size
     token = canvas.resize((display_size, display_size), Image.LANCZOS)
 
-    # ---- Circular crop ----
+    # ---- Circular crop (clipped to inner face region) ----
+    # When inner_radius_ratio < 1, the portrait occupies a smaller circle
+    # centred inside the coin face.  The area outside is transparent so
+    # the rim overlay and coin base colour show through.
+    inner_diam = int(display_size * inner_radius_ratio)
+    offset = (display_size - inner_diam) // 2
+
     circle_mask = Image.new("L", (display_size, display_size), 0)
     ImageDraw.Draw(circle_mask).ellipse(
-        [0, 0, display_size - 1, display_size - 1], fill=255)
+        [offset, offset, offset + inner_diam - 1, offset + inner_diam - 1],
+        fill=255,
+    )
 
     result = Image.new("RGBA", (display_size, display_size), (0, 0, 0, 0))
     white_bg = Image.new("RGBA", (display_size, display_size), (255, 255, 255, 255))
@@ -301,11 +332,27 @@ def render_halftone_token(
 # 3D Pixel-art coin shell from reference image
 # ---------------------------------------------------------------------------
 
-def load_coin_shell(path: str, display_size: int) -> Image.Image:
+def load_coin_shell(path: str, display_size: int) -> tuple[Image.Image, float]:
     """
-    Load the pixel-art coin reference and prepare it as an alpha mask.
-    The reference is black-on-white, so we threshold it and use the dark
-    pixels as the coin shell shape. Returns RGBA at display_size x display_size.
+    Load the pixel-art coin reference and parse it into a rim mask and
+    an inner_radius_ratio.
+
+    The reference is black-on-white:
+      * Black pixels → rim (the thick circular border ring)
+      * White pixels in the centre → inner face area (where the portrait goes)
+
+    We threshold, then measure how far inward the white centre extends to
+    compute inner_radius_ratio (typically ~0.60-0.70).
+
+    Returns
+    -------
+    rim_mask : Image (mode "L", display_size × display_size)
+        Grayscale mask where 255 = rim pixel, 0 = transparent.
+    inner_radius_ratio : float
+        Fraction of the coin radius occupied by the inner face (0..1).
+
+    Requirements for the reference image:
+      * Black-on-white, square aspect ratio preferred.
     """
     img = Image.open(path).convert("L")
 
@@ -317,10 +364,52 @@ def load_coin_shell(path: str, display_size: int) -> Image.Image:
 
     img = img.resize((display_size, display_size), Image.LANCZOS)
 
-    # Threshold: dark pixels become the shell
     arr = np.asarray(img)
-    shell_mask = (arr < 160).astype(np.uint8) * 255
-    return Image.fromarray(shell_mask, "L")
+
+    # Threshold: dark pixels (< 160) are the shell/rim
+    shell_pixels = arr < 160  # bool array
+
+    # --- Compute inner_radius_ratio by measuring the white centre ---
+    # The reference image may show the coin at a slight 3D angle, so
+    # some radial directions will hit the edge detail (dark pixels)
+    # much earlier than others.  To get a stable measurement we sample
+    # many radial lines and take the 75th percentile — this ignores
+    # the short "early hit" rays caused by the perspective edge.
+    cx = display_size / 2.0
+    cy = display_size / 2.0
+    max_r = display_size / 2.0
+
+    num_angles = 72  # sample every 5°
+    boundary_radii: list[float] = []
+    for ai in range(num_angles):
+        a = (ai / num_angles) * 2 * math.pi
+        dx = math.cos(a)
+        dy = math.sin(a)
+        # Walk outward from centre until we hit shell pixels
+        for ri in range(1, int(max_r)):
+            px = int(cx + dx * ri)
+            py = int(cy + dy * ri)
+            if 0 <= px < display_size and 0 <= py < display_size:
+                if shell_pixels[py, px]:
+                    boundary_radii.append(ri / max_r)
+                    break
+        else:
+            # Never hit shell on this ray — use full radius
+            boundary_radii.append(1.0)
+
+    if boundary_radii:
+        # 75th percentile ignores short rays from 3D perspective details
+        inner_radius_ratio = float(np.percentile(boundary_radii, 75))
+    else:
+        inner_radius_ratio = 0.65  # fallback
+
+    # Clamp to a sane range
+    inner_radius_ratio = max(0.50, min(inner_radius_ratio, 0.85))
+
+    rim_mask = (shell_pixels.astype(np.uint8)) * 255
+    rim_mask_img = Image.fromarray(rim_mask, "L")
+
+    return rim_mask_img, inner_radius_ratio
 
 
 def colorize_shell(shell_mask: Image.Image, fg_color: tuple[int, int, int]) -> Image.Image:
@@ -338,32 +427,122 @@ def darken_color(c: tuple[int, int, int], factor: float) -> tuple[int, int, int]
 
 
 # ---------------------------------------------------------------------------
-# Spinning 3D coin with pixel-art shell and halftone portrait face
+# Slab-based 3D coin rendering
 # ---------------------------------------------------------------------------
+#
+# The coin is composed of three layers per frame:
+#
+#   1. Edge/thickness slab  — a coloured rounded rectangle whose visible
+#      width = coin_thickness * abs(sin(angle)).  Gives the depth cue.
+#   2. Face disc            — the circular front or back, squished
+#      horizontally by cos(angle).
+#   3. Rim overlay          — the pixel-art rim ring, also squished by
+#      cos(angle), composited on top.
+#
+# Z-ordering depends on which side of the rotation we are on:
+#
+#   sin(angle) > 0  →  draw slab first, then face  (edge trails behind)
+#   sin(angle) < 0  →  draw face first, then slab  (edge in front)
+#
+# Edge-on frames (|cos| near 0): only the thickness slab is shown as a
+# narrow coloured strip with a highlight line for definition.
+# ---------------------------------------------------------------------------
+
+def render_coin_slab(
+    display_size: int,
+    angle: float,
+    thickness: int,
+    edge_color: tuple[int, int, int],
+    highlight_color: tuple[int, int, int],
+) -> Image.Image:
+    """
+    Render the coin thickness slab visible during rotation.
+
+    The slab is a vertical rounded rectangle centred on the canvas.  Its
+    width is ``thickness * abs(sin(angle))`` — widest when the coin is
+    edge-on, zero when face-on.
+
+    Parameters
+    ----------
+    display_size : int
+        Canvas width and height.
+    angle : float
+        Current rotation angle in radians.
+    thickness : int
+        Maximum pixel thickness of the coin edge.
+    edge_color : tuple
+        Base colour for the slab body.
+    highlight_color : tuple
+        Lighter colour for the centre highlight line.
+
+    Returns
+    -------
+    RGBA image at display_size × display_size.
+    """
+    slab_w = max(2, int(thickness * abs(math.sin(angle))))
+
+    canvas = Image.new("RGBA", (display_size, display_size), (0, 0, 0, 0))
+    draw = ImageDraw.Draw(canvas)
+
+    cx = display_size // 2
+    top = max(2, display_size // 20)
+    bottom = display_size - top
+
+    # Slab body — rounded rectangle
+    r = min(slab_w // 2, 6)  # corner radius
+    x0 = cx - slab_w // 2
+    x1 = cx + slab_w // 2
+    draw.rounded_rectangle([x0, top, x1, bottom], radius=r,
+                           fill=(*edge_color, 255))
+
+    # Centre highlight line for visual definition
+    if slab_w >= 4:
+        hl_w = max(1, slab_w // 4)
+        draw.rectangle(
+            [cx - hl_w // 2, top + 2, cx + hl_w // 2, bottom - 2],
+            fill=(*highlight_color, 255),
+        )
+
+    return canvas
+
 
 def build_3d_coin_frames(
     brightness: np.ndarray,
-    shell_mask: Image.Image,
+    rim_mask: Image.Image,
+    inner_radius_ratio: float,
     display_size: int,
     fg_color: tuple[int, int, int],
 ) -> list[Image.Image]:
     """
     Pre-render all rotation frames of the 3D coin for one colour.
 
-    The coin has:
-      - Face (front): halftone portrait with coloured border ring
-      - Back: solid colour disc with white inner ring
-      - Edge: multiple stacked layers creating visible 3D thickness
-      - Shell overlay: pixel-art coin reference applied on top for style
+    The coin is assembled per-frame from three layers (slab, face/back,
+    rim) with z-ordering that depends on the rotation angle.  See the
+    module-level comment block above for the full description.
 
-    The 3D effect comes from:
-      1. Horizontal squish based on cos(angle) for the face/back
-      2. Multiple offset edge layers visible when the coin is angled
-      3. Darker shading on the edge layers
+    Parameters
+    ----------
+    brightness : ndarray
+        Halftone brightness grid from ``portrait_to_brightness_grid()``.
+    rim_mask : Image (mode "L")
+        Grayscale mask of the pixel-art rim ring.
+    inner_radius_ratio : float
+        Fraction of coin radius for the portrait circle (from ``load_coin_shell``).
+    display_size : int
+        Pixel dimensions of the square coin canvas.
+    fg_color : tuple
+        Variant colour.
+
+    Returns
+    -------
+    List of RGBA images, one per rotation step.
     """
-    face = render_halftone_token(brightness, display_size, fg_color)
+    coin_thickness = display_size // 8  # adjustable: change divisor for thicker/thinner
 
-    # Add a coloured border ring to the face
+    # --- Pre-render static layers ---
+
+    # Face (front): halftone portrait clipped to inner face + coloured border ring
+    face = render_halftone_token(brightness, display_size, fg_color, inner_radius_ratio)
     ring = Image.new("RGBA", (display_size, display_size), (0, 0, 0, 0))
     ring_width = max(4, display_size // 25)
     ImageDraw.Draw(ring).ellipse(
@@ -371,7 +550,7 @@ def build_3d_coin_frames(
         outline=(*fg_color, 255), width=ring_width)
     face = Image.alpha_composite(face, ring)
 
-    # Back: solid colour circle with white inner ring
+    # Back: solid colour circle with white decorative inner ring
     back = Image.new("RGBA", (display_size, display_size), (0, 0, 0, 0))
     bd = ImageDraw.Draw(back)
     bd.ellipse([0, 0, display_size - 1, display_size - 1], fill=(*fg_color, 255))
@@ -384,83 +563,61 @@ def build_3d_coin_frames(
         [0, 0, display_size - 1, display_size - 1],
         outline=(*fg_color, 255), width=ring_w)
 
-    # Edge layer: a thin coloured disc (darker) used for 3D depth
+    # Edge colours
     edge_color = darken_color(fg_color, 0.55)
     edge_highlight = darken_color(fg_color, 0.75)
 
-    # Coloured shell from reference
-    shell_coloured = colorize_shell(shell_mask, fg_color)
+    # Coloured rim overlay from pixel-art reference
+    rim_coloured = colorize_shell(rim_mask, fg_color)
 
+    # --- Generate rotation frames ---
     frames: list[Image.Image] = []
     for step in range(COIN_ROTATION_STEPS):
         frac = step / COIN_ROTATION_STEPS
         angle = frac * 2 * math.pi
         cos_val = math.cos(angle)
         sin_val = math.sin(angle)
-        showing_face = cos_val >= 0
-        w_scale = abs(cos_val)
 
         canvas = Image.new("RGBA", (display_size, display_size), (0, 0, 0, 0))
 
-        if w_scale < 0.05:
-            # Edge-on: thin coloured rim with visible thickness
-            d = ImageDraw.Draw(canvas)
-            rim_w = max(4, int(display_size * 0.05))
-            cx = display_size // 2
+        # --- Edge-on case: only show thickness slab ---
+        if abs(cos_val) < 0.05:
+            slab = render_coin_slab(
+                display_size, angle, coin_thickness, edge_color, edge_highlight)
+            canvas = Image.alpha_composite(canvas, slab)
+            frames.append(canvas)
+            continue
 
-            # Draw multiple layers for thickness
-            for layer in range(COIN_EDGE_LAYERS):
-                offset = layer - COIN_EDGE_LAYERS // 2
-                lc = edge_highlight if layer == 0 else edge_color
-                d.rectangle(
-                    [cx - rim_w // 2 + offset, 3,
-                     cx + rim_w // 2 + offset, display_size - 4],
-                    fill=(*lc, 255))
+        # --- Normal rotation: assemble slab + face/back + rim ---
+        showing_face = cos_val >= 0
+        w_scale = abs(cos_val)
 
-            # Bright edge highlight
-            d.rectangle(
-                [cx - 1, 3, cx + 1, display_size - 4],
-                fill=(*fg_color, 255))
+        # Squish the face or back disc horizontally
+        src = face if showing_face else back
+        new_w = max(4, int(display_size * w_scale))
+        scaled_face = src.resize((new_w, display_size), Image.LANCZOS)
+        face_x = (display_size - new_w) // 2
 
+        # Build the slab for this angle
+        slab = render_coin_slab(
+            display_size, angle, coin_thickness, edge_color, edge_highlight)
+
+        # Apply z-ordering:
+        #   sin > 0  →  slab behind face  (edge trails behind the turning face)
+        #   sin < 0  →  face behind slab  (edge appears in front)
+        if sin_val > 0:
+            canvas = Image.alpha_composite(canvas, slab)
+            canvas.paste(scaled_face, (face_x, 0), scaled_face)
         else:
-            src = face if showing_face else back
-            new_w = max(4, int(display_size * w_scale))
+            canvas.paste(scaled_face, (face_x, 0), scaled_face)
+            canvas = Image.alpha_composite(canvas, slab)
 
-            # ---- 3D depth: draw edge layers behind the face ----
-            # The edge is visible when the coin is at an angle
-            # We offset layers in the direction the coin is turning
-            edge_offset_dir = 1 if sin_val >= 0 else -1
-            edge_thickness = max(1, int(COIN_EDGE_LAYERS * (1.0 - w_scale) * 0.8))
-
-            if edge_thickness > 1 and w_scale < 0.85:
-                # Create an edge disc
-                edge_disc = Image.new("RGBA", (display_size, display_size), (0, 0, 0, 0))
-                ed = ImageDraw.Draw(edge_disc)
-                ed.ellipse([0, 0, display_size - 1, display_size - 1],
-                           fill=(*edge_color, 255))
-
-                for layer_i in range(edge_thickness, 0, -1):
-                    layer_offset = edge_offset_dir * layer_i * 2
-                    layer_w = max(4, int(display_size * w_scale))
-                    scaled_edge = edge_disc.resize((layer_w, display_size), Image.LANCZOS)
-                    x_off = (display_size - layer_w) // 2 + layer_offset
-
-                    # Clamp offset to stay within canvas
-                    x_off = max(0, min(x_off, display_size - layer_w))
-                    canvas.paste(scaled_edge, (x_off, 0), scaled_edge)
-
-            # ---- Main face/back on top ----
-            scaled = src.resize((new_w, display_size), Image.LANCZOS)
-            x_off = (display_size - new_w) // 2
-            canvas.paste(scaled, (x_off, 0), scaled)
-
-        # ---- Overlay pixel-art shell (coloured) ----
-        # Scale the shell to match the current coin width for 3D consistency
-        if w_scale >= 0.3:
-            shell_w = max(4, int(display_size * w_scale))
-            scaled_shell = shell_coloured.resize((shell_w, display_size), Image.LANCZOS)
-            sx = (display_size - shell_w) // 2
-            canvas.paste(scaled_shell, (sx, 0), scaled_shell)
+        # Overlay the pixel-art rim (always on top for style consistency)
+        if w_scale >= 0.15:
+            rim_w = max(4, int(display_size * w_scale))
+            scaled_rim = rim_coloured.resize((rim_w, display_size), Image.LANCZOS)
+            rx = (display_size - rim_w) // 2
+            canvas.paste(scaled_rim, (rx, 0), scaled_rim)
 
         frames.append(canvas)
 
@@ -579,7 +736,9 @@ def assemble_gif(
     masks: list[Image.Image],
     configs: list[VariantConfig],
     brightness: np.ndarray,
-    shell_mask: Image.Image,
+    rim_mask: Image.Image,
+    inner_radius_ratio: float,
+    border_width: int,
 ) -> None:
     n = len(masks)
     token_display = int(QR_SIZE * COIN_RATIO)
@@ -591,7 +750,10 @@ def assemble_gif(
     print("  Pre-rendering 3D coin rotations per variant ...")
     token_frame_sets: list[list[Image.Image]] = []
     for i, cfg in enumerate(configs):
-        tfs = build_3d_coin_frames(brightness, shell_mask, token_display, cfg.front_color)
+        tfs = build_3d_coin_frames(
+            brightness, rim_mask, inner_radius_ratio,
+            token_display, cfg.front_color,
+        )
         token_frame_sets.append(tfs)
         direction = "CW" if (i % 2 == 0) else "CCW"
         print(f"    Variant {i+1} ({cfg.name}): {direction}, {len(tfs)} frames")
@@ -605,7 +767,7 @@ def assemble_gif(
 
     for i in range(n):
         print(f"  Variant {i+1}/{n} hold frames ...")
-        hold_base = compose_frame(masks[i], configs[i].front_color)
+        hold_base = compose_frame(masks[i], configs[i].front_color, border_width)
 
         for _ in range(hold_subframes):
             tf = get_token_frame_continuous(token_frame_sets, i, time_ms)
@@ -622,7 +784,7 @@ def assemble_gif(
             t = fi / (MORPH_FRAMES + 1)
             m_mask = gooey_morph_mask(masks[i], masks[ni], t)
             fg = lerp_color(configs[i].front_color, configs[ni].front_color, t)
-            f = compose_frame(m_mask, fg)
+            f = compose_frame(m_mask, fg, border_width)
 
             # Blend token frames from both variants during morph
             tf_a = get_token_frame_continuous(token_frame_sets, i, time_ms)
@@ -668,10 +830,12 @@ def main() -> None:
 
     print("Loading pixel-art coin shell reference ...")
     token_display = int(QR_SIZE * COIN_RATIO)
-    shell_mask = load_coin_shell(COIN_SHELL_PATH, token_display)
-    print(f"  Shell loaded at {shell_mask.size[0]}x{shell_mask.size[1]}\n")
+    rim_mask, inner_radius_ratio = load_coin_shell(COIN_SHELL_PATH, token_display)
+    print(f"  Rim mask loaded at {rim_mask.size[0]}x{rim_mask.size[1]}")
+    print(f"  Inner radius ratio: {inner_radius_ratio:.3f}\n")
 
     # Determine QR version first so we can compute centre blank radius
+    # and derive the dynamic border width.
     print("Determining QR version ...")
     probe = qrcode.QRCode(
         error_correction=qrcode.constants.ERROR_CORRECT_H,
@@ -681,8 +845,19 @@ def main() -> None:
     probe.make(fit=True)
     qr_version = probe.version
     blank_radius = compute_blank_radius(qr_version)
+
+    # Dynamic border width: match ~1 QR module so the border visually
+    # aligns with the finder-pattern eye outlines.
+    modules_with_border = probe.modules_count + 2 * probe.border
+    module_px = QR_SIZE / modules_with_border
+    # Clamp: at least 1px, at most half the offset margin (so border
+    # doesn't bleed over the QR area).
+    max_border = (CANVAS_SIZE - QR_SIZE) // 2
+    border_width = max(1, min(int(round(module_px)), max_border))
+
     print(f"  QR version {qr_version} ({probe.modules_count}x{probe.modules_count})")
-    print(f"  Centre blank radius: {blank_radius} modules\n")
+    print(f"  Centre blank radius: {blank_radius} modules")
+    print(f"  Border width: {border_width}px (~1 module = {module_px:.1f}px)\n")
 
     print("Generating QR variants (with centre blank-out) ...")
     masks: list[Image.Image] = []
@@ -694,7 +869,7 @@ def main() -> None:
     print()
 
     print("Assembling GIF ...")
-    assemble_gif(masks, VARIANTS, brightness, shell_mask)
+    assemble_gif(masks, VARIANTS, brightness, rim_mask, inner_radius_ratio, border_width)
 
     total_ms = len(VARIANTS) * (HOLD_DURATION_MS + MORPH_DURATION_MS)
     nframes = len(VARIANTS) * (HOLD_DURATION_MS // HOLD_SUBFRAME_MS + MORPH_FRAMES)
