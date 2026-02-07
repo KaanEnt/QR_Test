@@ -61,10 +61,10 @@ COIN_CLEAR_BLOCK = 20          # clearance zone block size (px)
 # (COIN_EDGE_LAYERS removed — replaced by slab-based 3D rendering)
 
 # How many QR modules (radius) to blank in the centre for the token.
-CENTER_BLANK_EXTRA = 2         # extra modules beyond the token edge
+CENTER_BLANK_EXTRA = 0         # keep tight; clearance mask handles visual padding
 
 # Halftone portrait grid
-HALFTONE_GRID = 40             # cells per side for the halftone mosaic
+HALFTONE_GRID = 64             # cells per side for the halftone mosaic
 
 
 # ═══════════════════════════════════════════════════════════════════════════
@@ -142,7 +142,7 @@ def generate_qr_mask(url: str, cfg: VariantConfig, blank_radius_modules: int = 0
         version=None,
         error_correction=qrcode.constants.ERROR_CORRECT_H,
         box_size=10,
-        border=2,
+        border=4,
     )
     qr.add_data(url)
     qr.make(fit=True)
@@ -166,15 +166,17 @@ def compute_blank_radius(qr_version: int) -> int:
     the token size relative to the QR grid.
     """
     modules_count = qr_version * 4 + 17  # standard QR formula
-    border = 2
+    border = 4  # QR spec quiet zone
     total = modules_count + 2 * border
 
     # Token diameter in pixels = QR_SIZE * COIN_RATIO
     # Module size in pixels = QR_SIZE / total
     module_px = QR_SIZE / total
     token_diameter_px = QR_SIZE * COIN_RATIO
-    # Add clearance for the blocky zone + extra padding
-    clearance_px = COIN_CLEAR_BLOCK * 3  # generous clearance
+    # Clearance must be tight enough to stay well under 30% erasure limit
+    # (ERROR_CORRECT_H). One block of margin is sufficient since the
+    # blocky clearance mask already adds visual padding.
+    clearance_px = COIN_CLEAR_BLOCK * 1.5
     total_blank_diameter_px = token_diameter_px + clearance_px
 
     blank_radius_modules = int(math.ceil(total_blank_diameter_px / (2 * module_px))) + CENTER_BLANK_EXTRA
@@ -213,9 +215,12 @@ def compose_frame(
     offset = (CANVAS_SIZE - QR_SIZE) // 2
     base.paste(qr, (offset, offset), qr)
 
-    # Border sits BORDER_PAD pixels outside the QR area
+    # Border sits outside the QR area. Pillow draws the stroke centred
+    # on the rectangle coords, so we push it outward by half the width
+    # to guarantee it never overlaps QR modules.
     draw = ImageDraw.Draw(base)
-    b = offset - BORDER_PAD
+    half_bw = border_width / 2
+    b = offset - BORDER_PAD - half_bw
     draw.rectangle(
         [b, b, CANVAS_SIZE - b - 1, CANVAS_SIZE - b - 1],
         outline=(*fg, 255),
@@ -263,9 +268,9 @@ def render_halftone_token(
     """
     Render the portrait as a halftone-style mosaic inside a circle.
 
-    Each cell in the brightness grid becomes a filled square whose size is
-    proportional to the darkness of that cell. Dark cells -> large filled
-    squares, light cells -> small or no squares. This produces a bold,
+    Each cell in the brightness grid becomes a filled circle whose radius
+    is proportional to the darkness of that cell.  Dark cells -> large
+    dots, light cells -> small or no dots.  This produces a bold,
     stylised portrait that reads well even at small sizes.
 
     Parameters
@@ -273,13 +278,13 @@ def render_halftone_token(
     inner_radius_ratio : float
         Fraction of the full coin diameter used for the portrait circle.
         1.0 = fill entire coin (legacy behaviour).
-        ~0.65 = confine portrait to the inner face, leaving space for the rim.
+        ~0.60 = confine portrait to the inner face, leaving space for the rim.
 
     Returns RGBA at display_size x display_size.
     """
     grid_h, grid_w = brightness.shape
-    # Work at 2x resolution for crisp edges, then downsample
-    work_size = display_size * 2
+    # Work at 4x resolution for crisp circular dots, then downsample
+    work_size = display_size * 4
     cell_w = work_size / grid_w
     cell_h = work_size / grid_h
 
@@ -289,22 +294,21 @@ def render_halftone_token(
     for row in range(grid_h):
         for col in range(grid_w):
             darkness = 1.0 - brightness[row, col]  # 0=white, 1=black
-            if darkness < 0.08:
+            if darkness < 0.06:
                 continue  # skip very light cells
 
-            # Square size proportional to darkness (min 30%, max 95% of cell)
-            fill_frac = 0.3 + darkness * 0.65
+            # Dot radius proportional to darkness
+            max_r = min(cell_w, cell_h) * 0.48  # max radius = 48% of cell
+            dot_r = max_r * (0.25 + darkness * 0.75)
             cx = (col + 0.5) * cell_w
             cy = (row + 0.5) * cell_h
-            half_w = cell_w * fill_frac / 2
-            half_h = cell_h * fill_frac / 2
 
-            draw.rectangle(
-                [cx - half_w, cy - half_h, cx + half_w, cy + half_h],
+            draw.ellipse(
+                [cx - dot_r, cy - dot_r, cx + dot_r, cy + dot_r],
                 fill=(*fg_color, 255),
             )
 
-    # Downsample to display size
+    # Downsample to display size with high-quality resampling
     token = canvas.resize((display_size, display_size), Image.LANCZOS)
 
     # ---- Circular crop (clipped to inner face region) ----
@@ -458,9 +462,12 @@ def render_coin_slab(
     """
     Render the coin thickness slab visible during rotation.
 
-    The slab is a vertical rounded rectangle centred on the canvas.  Its
-    width is ``thickness * abs(sin(angle))`` — widest when the coin is
-    edge-on, zero when face-on.
+    The slab is shaped like a vertical pill/capsule that matches the coin's
+    circular silhouette.  Its width is ``thickness * abs(sin(angle))`` —
+    widest when the coin is edge-on, zero when face-on.
+
+    The slab is horizontally offset based on ``sin(angle)`` so it naturally
+    trails behind or leads in front of the face disc.
 
     Parameters
     ----------
@@ -479,29 +486,45 @@ def render_coin_slab(
     -------
     RGBA image at display_size × display_size.
     """
-    slab_w = max(2, int(thickness * abs(math.sin(angle))))
+    sin_val = math.sin(angle)
+    slab_w = max(2, int(thickness * abs(sin_val)))
 
     canvas = Image.new("RGBA", (display_size, display_size), (0, 0, 0, 0))
     draw = ImageDraw.Draw(canvas)
 
     cx = display_size // 2
-    top = max(2, display_size // 20)
-    bottom = display_size - top
+    cy = display_size // 2
+    # Offset the slab in the direction of the trailing edge
+    # When sin > 0 the edge is to the right of centre, when < 0 to the left
+    offset_x = int(sin_val * thickness * 0.45)
 
-    # Slab body — rounded rectangle
-    r = min(slab_w // 2, 6)  # corner radius
-    x0 = cx - slab_w // 2
-    x1 = cx + slab_w // 2
-    draw.rounded_rectangle([x0, top, x1, bottom], radius=r,
-                           fill=(*edge_color, 255))
+    # Draw the slab as a pill shape (stadium / capsule) that matches
+    # the coin's circular height. The pill top/bottom are semicircles.
+    pad = max(2, display_size // 40)  # small top/bottom margin
+    pill_cx = cx + offset_x
+    pill_top = pad
+    pill_bot = display_size - pad
+    pill_left = pill_cx - slab_w // 2
+    pill_right = pill_cx + slab_w // 2
 
-    # Centre highlight line for visual definition
-    if slab_w >= 4:
-        hl_w = max(1, slab_w // 4)
-        draw.rectangle(
-            [cx - hl_w // 2, top + 2, cx + hl_w // 2, bottom - 2],
-            fill=(*highlight_color, 255),
+    # Use rounded_rectangle with large radius to get capsule shape
+    corner_r = slab_w // 2
+    if pill_right > pill_left and pill_bot > pill_top:
+        draw.rounded_rectangle(
+            [pill_left, pill_top, pill_right, pill_bot],
+            radius=corner_r,
+            fill=(*edge_color, 255),
         )
+
+        # Centre highlight line for visual definition
+        if slab_w >= 4:
+            hl_w = max(1, slab_w // 5)
+            hl_x = pill_cx
+            draw.rounded_rectangle(
+                [hl_x - hl_w // 2, pill_top + 3, hl_x + hl_w // 2, pill_bot - 3],
+                radius=max(1, hl_w // 2),
+                fill=(*highlight_color, 255),
+            )
 
     return canvas
 
@@ -598,13 +621,13 @@ def build_3d_coin_frames(
         scaled_face = src.resize((new_w, display_size), Image.LANCZOS)
         face_x = (display_size - new_w) // 2
 
-        # Build the slab for this angle
+        # Build the slab for this angle (slab self-offsets via sin)
         slab = render_coin_slab(
             display_size, angle, coin_thickness, edge_color, edge_highlight)
 
         # Apply z-ordering:
-        #   sin > 0  →  slab behind face  (edge trails behind the turning face)
-        #   sin < 0  →  face behind slab  (edge appears in front)
+        #   sin > 0  →  slab behind face  (edge trails to the right)
+        #   sin < 0  →  face behind slab  (edge appears in front, to the left)
         if sin_val > 0:
             canvas = Image.alpha_composite(canvas, slab)
             canvas.paste(scaled_face, (face_x, 0), scaled_face)
@@ -612,8 +635,9 @@ def build_3d_coin_frames(
             canvas.paste(scaled_face, (face_x, 0), scaled_face)
             canvas = Image.alpha_composite(canvas, slab)
 
-        # Overlay the pixel-art rim (always on top for style consistency)
-        if w_scale >= 0.15:
+        # Overlay the pixel-art rim (always on top for style consistency).
+        # The rim is squished the same as the face disc — it sits on the face.
+        if w_scale >= 0.12:
             rim_w = max(4, int(display_size * w_scale))
             scaled_rim = rim_coloured.resize((rim_w, display_size), Image.LANCZOS)
             rx = (display_size - rim_w) // 2
@@ -666,8 +690,9 @@ def make_blocky_clearance_mask(
 
     cx = canvas_size // 2
     cy = canvas_size // 2
-    # Radius: token + 2 blocks of margin
-    radius = token_display // 2 + block * 2
+    # Radius: token + 1 block of margin (tight to avoid covering
+    # alignment patterns that sit near the centre)
+    radius = token_display // 2 + block
 
     for bx in range(0, canvas_size, block):
         for by in range(0, canvas_size, block):
@@ -839,25 +864,24 @@ def main() -> None:
     print("Determining QR version ...")
     probe = qrcode.QRCode(
         error_correction=qrcode.constants.ERROR_CORRECT_H,
-        box_size=10, border=2,
+        box_size=10, border=4,
     )
     probe.add_data(url)
     probe.make(fit=True)
     qr_version = probe.version
     blank_radius = compute_blank_radius(qr_version)
 
-    # Dynamic border width: match ~1 QR module so the border visually
-    # aligns with the finder-pattern eye outlines.
+    # Dynamic border width: match the finder-pattern eye ring thickness.
+    # The eye outer ring is nominally 1 module, but the rounded drawer
+    # anti-aliases it so visually it looks ~60-70% of a raw module.
     modules_with_border = probe.modules_count + 2 * probe.border
     module_px = QR_SIZE / modules_with_border
-    # Clamp: at least 1px, at most half the offset margin (so border
-    # doesn't bleed over the QR area).
     max_border = (CANVAS_SIZE - QR_SIZE) // 2
-    border_width = max(1, min(int(round(module_px)), max_border))
+    border_width = max(2, min(int(round(module_px * 0.65)), max_border))
 
     print(f"  QR version {qr_version} ({probe.modules_count}x{probe.modules_count})")
     print(f"  Centre blank radius: {blank_radius} modules")
-    print(f"  Border width: {border_width}px (~1 module = {module_px:.1f}px)\n")
+    print(f"  Border width: {border_width}px (~0.65 module = {module_px:.1f}px)\n")
 
     print("Generating QR variants (with centre blank-out) ...")
     masks: list[Image.Image] = []
