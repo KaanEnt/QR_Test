@@ -101,12 +101,6 @@ VARIANTS: list[VariantConfig] = [
         eye_drawer=RoundedModuleDrawer(),
         front_color=(0, 69, 172),       # Diode Blue 20-0147 TPM  #0045AC
     ),
-    VariantConfig(
-        name="Cool Gray Rounded",
-        module_drawer=RoundedModuleDrawer(),
-        eye_drawer=RoundedModuleDrawer(),
-        front_color=(117, 120, 123),    # Cool Gray 9 C  #75787B
-    ),
 ]
 
 
