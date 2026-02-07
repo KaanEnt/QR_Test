@@ -61,7 +61,7 @@ COIN_RATIO = 0.34              # token diameter relative to QR_SIZE
 COIN_SPIN_PERIOD_MS = 5000     # 5 seconds per full rotation (slower)
 COIN_ROTATION_STEPS = 60       # pre-rendered frames in one full spin
 COIN_CLEAR_BLOCK = 20          # clearance zone block size (px)
-# (COIN_EDGE_LAYERS removed — replaced by slab-based 3D rendering)
+# Edge thickness controlled by COIN_THICKNESS_DIVISOR in the 3D section below
 
 # How many QR modules (radius) to blank in the centre for the token.
 CENTER_BLANK_EXTRA = 0         # keep tight; clearance mask handles visual padding
@@ -528,100 +528,88 @@ def darken_color(c: tuple[int, int, int], factor: float) -> tuple[int, int, int]
 
 
 # ---------------------------------------------------------------------------
-# Slab-based 3D coin rendering
+# 3D coin rendering with stacked-ellipse edge
 # ---------------------------------------------------------------------------
 #
-# The coin is composed of three layers per frame:
+# The coin is composed of layers per frame:
 #
-#   1. Edge/thickness slab  — a coloured rounded rectangle whose visible
-#      width = coin_thickness * abs(sin(angle)).  Gives the depth cue.
-#   2. Face disc            — the circular front or back, squished
-#      horizontally by cos(angle).
-#   3. Rim overlay          — the pixel-art rim ring, also squished by
-#      cos(angle), composited on top.
+#   1. Edge: stacked thin ellipses that simulate the coin's circular
+#      thickness.  Each slice is offset horizontally by sin(angle) and
+#      gets progressively darker toward the back.  This produces a smooth,
+#      convincing 3D coin edge without capsule/slab artifacts.
+#   2. Face disc: the circular front or back, squished horizontally by
+#      cos(angle).  The pixel-art rim is composited onto the face BEFORE
+#      squishing so it distorts naturally with the perspective.
 #
-# Z-ordering depends on which side of the rotation we are on:
+# Z-ordering:
+#   sin(angle) > 0  →  draw edge first, then face  (edge behind)
+#   sin(angle) < 0  →  draw face first, then edge  (edge in front)
 #
-#   sin(angle) > 0  →  draw slab first, then face  (edge trails behind)
-#   sin(angle) < 0  →  draw face first, then slab  (edge in front)
-#
-# Edge-on frames (|cos| near 0): only the thickness slab is shown as a
-# narrow coloured strip with a highlight line for definition.
+# Edge-on (|cos| near 0): only the stacked edge is visible.
 # ---------------------------------------------------------------------------
 
-def render_coin_slab(
+COIN_THICKNESS_DIVISOR = 10  # display_size / this = max edge thickness in px
+
+
+def _draw_edge_ellipses(
+    canvas: Image.Image,
     display_size: int,
     angle: float,
     thickness: int,
-    edge_color: tuple[int, int, int],
-    highlight_color: tuple[int, int, int],
+    base_color: tuple[int, int, int],
 ) -> Image.Image:
     """
-    Render the coin thickness slab visible during rotation.
+    Draw the coin edge as stacked horizontal ellipse slices.
 
-    The slab is shaped like a vertical pill/capsule that matches the coin's
-    circular silhouette.  Its width is ``thickness * abs(sin(angle))`` —
-    widest when the coin is edge-on, zero when face-on.
-
-    The slab is horizontally offset based on ``sin(angle)`` so it naturally
-    trails behind or leads in front of the face disc.
-
-    Parameters
-    ----------
-    display_size : int
-        Canvas width and height.
-    angle : float
-        Current rotation angle in radians.
-    thickness : int
-        Maximum pixel thickness of the coin edge.
-    edge_color : tuple
-        Base colour for the slab body.
-    highlight_color : tuple
-        Lighter colour for the centre highlight line.
-
-    Returns
-    -------
-    RGBA image at display_size × display_size.
+    Each slice is a thin vertical ellipse offset along the x-axis
+    according to its depth position and the rotation angle.  The
+    back-most slices are darkest, the front-most are lightest.
     """
     sin_val = math.sin(angle)
-    slab_w = max(2, int(thickness * abs(sin_val)))
-
-    canvas = Image.new("RGBA", (display_size, display_size), (0, 0, 0, 0))
+    cos_val = math.cos(angle)
     draw = ImageDraw.Draw(canvas)
 
     cx = display_size // 2
     cy = display_size // 2
-    # Offset the slab in the direction of the trailing edge
-    # When sin > 0 the edge is to the right of centre, when < 0 to the left
-    offset_x = int(sin_val * thickness * 0.45)
+    coin_r = display_size // 2 - 2  # small margin so we don't clip
 
-    # Draw the slab as a pill shape (stadium / capsule) that matches
-    # the coin's circular height. The pill top/bottom are semicircles.
-    pad = max(2, display_size // 40)  # small top/bottom margin
-    pill_cx = cx + offset_x
-    pill_top = pad
-    pill_bot = display_size - pad
-    pill_left = pill_cx - slab_w // 2
-    pill_right = pill_cx + slab_w // 2
+    # Number of visible edge slices depends on how edge-on the coin is
+    num_slices = max(2, int(thickness * abs(sin_val)))
+    if num_slices < 1:
+        return canvas
 
-    # Use rounded_rectangle with large radius to get capsule shape
-    corner_r = slab_w // 2
-    if pill_right > pill_left and pill_bot > pill_top:
-        draw.rounded_rectangle(
-            [pill_left, pill_top, pill_right, pill_bot],
-            radius=corner_r,
-            fill=(*edge_color, 255),
+    # Total visible width of the edge in pixels
+    edge_visible_w = max(2, int(thickness * abs(sin_val)))
+
+    for i in range(num_slices):
+        # t goes from 0 (back-most slice) to 1 (front-most)
+        t = i / max(1, num_slices - 1) if num_slices > 1 else 0.5
+
+        # Horizontal offset: evenly spread slices across edge_visible_w
+        # Back slices (t=0) are furthest from the face disc
+        raw_offset = (0.5 - t) * edge_visible_w
+        slice_offset = int(math.copysign(1, sin_val) * raw_offset)
+
+        # Darkness gradient: back-most is darkest, front-most is lightest
+        darkness = 0.30 + 0.50 * t  # range 0.30 to 0.80
+        sc = darken_color(base_color, darkness)
+
+        # Each slice is a thin vertical ellipse, slightly wider for coverage
+        slice_w = max(1, edge_visible_w // max(1, num_slices - 1) + 1)
+        sx = cx + slice_offset
+        draw.ellipse(
+            [sx - slice_w, cy - coin_r, sx + slice_w, cy + coin_r],
+            fill=(*sc, 255),
         )
 
-        # Centre highlight line for visual definition
-        if slab_w >= 4:
-            hl_w = max(1, slab_w // 5)
-            hl_x = pill_cx
-            draw.rounded_rectangle(
-                [hl_x - hl_w // 2, pill_top + 3, hl_x + hl_w // 2, pill_bot - 3],
-                radius=max(1, hl_w // 2),
-                fill=(*highlight_color, 255),
-            )
+    # Highlight stripe on the leading edge (closest to the face disc)
+    if num_slices >= 3:
+        highlight = darken_color(base_color, 0.90)
+        hl_x = cx  # leading edge is at centre when face is nearby
+        draw.ellipse(
+            [hl_x - 1, cy - coin_r + 2, hl_x + 1, cy + coin_r - 2],
+            fill=(*highlight, 255),
+        )
 
     return canvas
 
@@ -636,18 +624,18 @@ def build_3d_coin_frames(
     """
     Pre-render all rotation frames of the 3D coin for one colour.
 
-    The coin is assembled per-frame from three layers (slab, face/back,
-    rim) with z-ordering that depends on the rotation angle.  See the
-    module-level comment block above for the full description.
+    The coin is assembled per-frame from edge ellipses + face disc.
+    The pixel-art rim is composited onto the face disc BEFORE the
+    perspective squish so it deforms naturally.
 
     Parameters
     ----------
     brightness : ndarray
         Halftone brightness grid from ``portrait_to_brightness_grid()``.
     rim_mask : Image (mode "L")
-        Grayscale mask of the pixel-art rim ring.
+        Grayscale mask of the pixel-art rim ring (front-facing, symmetrical).
     inner_radius_ratio : float
-        Fraction of coin radius for the portrait circle (from ``load_coin_shell``).
+        Fraction of coin radius for the portrait circle.
     display_size : int
         Pixel dimensions of the square coin canvas.
     fg_color : tuple
@@ -657,38 +645,51 @@ def build_3d_coin_frames(
     -------
     List of RGBA images, one per rotation step.
     """
-    coin_thickness = display_size // 8  # adjustable: change divisor for thicker/thinner
+    coin_thickness = display_size // COIN_THICKNESS_DIVISOR
 
-    # --- Pre-render static layers ---
+    # --- Pre-render the face disc ---
+    # Halftone portrait in the inner circle
+    face_portrait = render_halftone_token(
+        brightness, display_size, fg_color, inner_radius_ratio)
 
-    # Face (front): halftone portrait clipped to inner face + coloured border ring
-    face = render_halftone_token(brightness, display_size, fg_color, inner_radius_ratio)
-    ring = Image.new("RGBA", (display_size, display_size), (0, 0, 0, 0))
-    ring_width = max(4, display_size // 25)
-    ImageDraw.Draw(ring).ellipse(
+    # Composite the pixel-art rim ON TOP of the portrait (on the face)
+    rim_coloured = colorize_shell(rim_mask, fg_color)
+    face = Image.alpha_composite(face_portrait, rim_coloured)
+
+    # Also add a thin outer ring for clean circle definition
+    ring_layer = Image.new("RGBA", (display_size, display_size), (0, 0, 0, 0))
+    ring_w = max(2, display_size // 40)
+    ImageDraw.Draw(ring_layer).ellipse(
         [0, 0, display_size - 1, display_size - 1],
-        outline=(*fg_color, 255), width=ring_width)
-    face = Image.alpha_composite(face, ring)
+        outline=(*fg_color, 255), width=ring_w)
+    face = Image.alpha_composite(face, ring_layer)
 
-    # Back: solid colour circle with white decorative inner ring
+    # Clip the face to a circle (ensure no square corners leak)
+    face_circle_mask = Image.new("L", (display_size, display_size), 0)
+    ImageDraw.Draw(face_circle_mask).ellipse(
+        [0, 0, display_size - 1, display_size - 1], fill=255)
+    face_clipped = Image.new("RGBA", (display_size, display_size), (0, 0, 0, 0))
+    face_clipped.paste(face, mask=face_circle_mask)
+    face = face_clipped
+
+    # --- Pre-render the back disc ---
     back = Image.new("RGBA", (display_size, display_size), (0, 0, 0, 0))
     bd = ImageDraw.Draw(back)
-    bd.ellipse([0, 0, display_size - 1, display_size - 1], fill=(*fg_color, 255))
+    bd.ellipse([0, 0, display_size - 1, display_size - 1],
+               fill=(*fg_color, 255))
     inset = display_size // 5
     bd.ellipse(
         [inset, inset, display_size - 1 - inset, display_size - 1 - inset],
-        outline=(255, 255, 255, 255), width=max(3, display_size // 40))
-    ring_w = max(3, display_size // 35)
+        outline=(255, 255, 255, 180), width=max(2, display_size // 45))
+    # Outer ring on back too
     bd.ellipse(
         [0, 0, display_size - 1, display_size - 1],
-        outline=(*fg_color, 255), width=ring_w)
-
-    # Edge colours
-    edge_color = darken_color(fg_color, 0.55)
-    edge_highlight = darken_color(fg_color, 0.75)
-
-    # Coloured rim overlay from pixel-art reference
-    rim_coloured = colorize_shell(rim_mask, fg_color)
+        outline=(*darken_color(fg_color, 0.7), 255),
+        width=max(2, display_size // 40))
+    # Clip back to circle
+    back_clipped = Image.new("RGBA", (display_size, display_size), (0, 0, 0, 0))
+    back_clipped.paste(back, mask=face_circle_mask)
+    back = back_clipped
 
     # --- Generate rotation frames ---
     frames: list[Image.Image] = []
@@ -700,45 +701,38 @@ def build_3d_coin_frames(
 
         canvas = Image.new("RGBA", (display_size, display_size), (0, 0, 0, 0))
 
-        # --- Edge-on case: only show thickness slab ---
-        if abs(cos_val) < 0.05:
-            slab = render_coin_slab(
-                display_size, angle, coin_thickness, edge_color, edge_highlight)
-            canvas = Image.alpha_composite(canvas, slab)
+        # --- Edge-on: only show edge ---
+        if abs(cos_val) < 0.04:
+            canvas = _draw_edge_ellipses(
+                canvas, display_size, angle, coin_thickness, fg_color)
             frames.append(canvas)
             continue
 
-        # --- Normal rotation: assemble slab + face/back + rim ---
+        # --- Determine which side is showing ---
         showing_face = cos_val >= 0
         w_scale = abs(cos_val)
 
-        # Squish the face or back disc horizontally
+        # Squish the disc horizontally by cos(angle)
         src = face if showing_face else back
         new_w = max(4, int(display_size * w_scale))
-        scaled_face = src.resize((new_w, display_size), Image.LANCZOS)
-        face_x = (display_size - new_w) // 2
+        scaled_disc = src.resize((new_w, display_size), Image.LANCZOS)
+        disc_x = (display_size - new_w) // 2
 
-        # Build the slab for this angle (slab self-offsets via sin)
-        slab = render_coin_slab(
-            display_size, angle, coin_thickness, edge_color, edge_highlight)
+        # Build edge layer
+        edge_layer = Image.new(
+            "RGBA", (display_size, display_size), (0, 0, 0, 0))
+        edge_layer = _draw_edge_ellipses(
+            edge_layer, display_size, angle, coin_thickness, fg_color)
 
-        # Apply z-ordering:
-        #   sin > 0  →  slab behind face  (edge trails to the right)
-        #   sin < 0  →  face behind slab  (edge appears in front, to the left)
-        if sin_val > 0:
-            canvas = Image.alpha_composite(canvas, slab)
-            canvas.paste(scaled_face, (face_x, 0), scaled_face)
+        # Z-ordering based on sin
+        if sin_val >= 0:
+            # Edge behind the face
+            canvas = Image.alpha_composite(canvas, edge_layer)
+            canvas.paste(scaled_disc, (disc_x, 0), scaled_disc)
         else:
-            canvas.paste(scaled_face, (face_x, 0), scaled_face)
-            canvas = Image.alpha_composite(canvas, slab)
-
-        # Overlay the pixel-art rim (always on top for style consistency).
-        # The rim is squished the same as the face disc — it sits on the face.
-        if w_scale >= 0.12:
-            rim_w = max(4, int(display_size * w_scale))
-            scaled_rim = rim_coloured.resize((rim_w, display_size), Image.LANCZOS)
-            rx = (display_size - rim_w) // 2
-            canvas.paste(scaled_rim, (rx, 0), scaled_rim)
+            # Face behind the edge
+            canvas.paste(scaled_disc, (disc_x, 0), scaled_disc)
+            canvas = Image.alpha_composite(canvas, edge_layer)
 
         frames.append(canvas)
 
