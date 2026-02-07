@@ -57,10 +57,10 @@ MORPH_FRAME_MS = MORPH_DURATION_MS // MORPH_FRAMES
 # ---- Spinning coin token -------------------------------------------------
 COIN_IMAGE_PATH = "public/event_pfp2.png"
 COIN_SHELL_PATH = "public/pixel-art-coin.jpg"   # 3D coin reference
-COIN_RATIO = 0.34              # token diameter relative to QR_SIZE
+COIN_RATIO = 0.22              # token diameter relative to QR_SIZE
 COIN_SPIN_PERIOD_MS = 5000     # 5 seconds per full rotation (slower)
 COIN_ROTATION_STEPS = 60       # pre-rendered frames in one full spin
-COIN_CLEAR_BLOCK = 20          # clearance zone block size (px)
+COIN_CLEAR_BLOCK = 16          # clearance zone block size (px)
 # Edge thickness controlled by COIN_THICKNESS_DIVISOR in the 3D section below
 
 # How many QR modules (radius) to blank in the centre for the token.
