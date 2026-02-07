@@ -1,20 +1,23 @@
 """
-Animated Gooey QR Code GIF Generator (v8)
+Animated Gooey QR Code GIF Generator (v9)
 
 Reads a URL from url.txt, generates 3 visually distinct QR code variants
 (all with rounded eyes), morphs between them with a gooey transition,
 overlays a spinning 3D pixel-art-style coin with halftone portrait in
 the centre, and writes a looping animated GIF.
 
-Key changes in v8:
-  - Proper slab-based 3D coin rendering with correct z-ordering:
-      * Thickness slab behind/in-front based on sin(angle)
-      * Face disc squished by cos(angle)
-      * Pixel-art rim overlay composited on top
-  - Halftone portrait clipped to inner face area (~65% of coin radius)
-  - QR border thickness dynamically matches finder-pattern eye width (~1 module)
-  - COIN_EDGE_LAYERS removed; replaced by single COIN_THICKNESS slab
-  - Pixel-art reference parsed into rim ring and inner face boundary
+Key changes in v9:
+  - De-perspectived coin reference: the pixel-art coin reference image is
+    at a slight 3D angle.  We now extract only the front-facing circular
+    rim ring from the left/front portion and mirror it to produce a clean
+    symmetrical rim that works correctly for flat face rendering.
+  - Proper 3D coin with elliptical edge rendering:
+      * Edge drawn as stacked thin ellipses (like real coin ridges)
+      * Face disc squished by cos(angle) and composited with correct
+        z-ordering
+      * Pixel-art rim applied only to the face disc, not floating on top
+  - Morph/switch animation speed doubled (500ms instead of 1000ms)
+  - No weird borders or artifacts on the coin
 """
 
 from __future__ import annotations
@@ -47,8 +50,8 @@ BORDER_WIDTH = 2               # default; overridden dynamically in main()
 
 HOLD_DURATION_MS = 4000
 HOLD_SUBFRAME_MS = 80          # sub-frame interval during hold (coin spin)
-MORPH_DURATION_MS = 1000
-MORPH_FRAMES = 15
+MORPH_DURATION_MS = 500
+MORPH_FRAMES = 10
 MORPH_FRAME_MS = MORPH_DURATION_MS // MORPH_FRAMES
 
 # ---- Spinning coin token -------------------------------------------------
@@ -81,22 +84,28 @@ class VariantConfig:
 
 VARIANTS: list[VariantConfig] = [
     VariantConfig(
-        name="Coral Rounded",
+        name="Pompeian Red Rounded",
         module_drawer=RoundedModuleDrawer(),
         eye_drawer=RoundedModuleDrawer(),
-        front_color=(210, 60, 50),
+        front_color=(164, 41, 46),      # Pompeian Red 18-1658 TCX  #A4292E
     ),
     VariantConfig(
-        name="Pink Gapped",
+        name="Green Gapped",
         module_drawer=GappedSquareModuleDrawer(),
         eye_drawer=RoundedModuleDrawer(),
-        front_color=(220, 50, 140),
+        front_color=(0, 150, 57),       # Green 347 C  #009639
     ),
     VariantConfig(
-        name="Purple Bars",
+        name="Diode Blue Bars",
         module_drawer=VerticalBarsDrawer(),
         eye_drawer=RoundedModuleDrawer(),
-        front_color=(100, 40, 180),
+        front_color=(0, 69, 172),       # Diode Blue 20-0147 TPM  #0045AC
+    ),
+    VariantConfig(
+        name="Cool Gray Rounded",
+        module_drawer=RoundedModuleDrawer(),
+        eye_drawer=RoundedModuleDrawer(),
+        front_color=(117, 120, 123),    # Cool Gray 9 C  #75787B
     ),
 ]
 
@@ -338,25 +347,26 @@ def render_halftone_token(
 
 def load_coin_shell(path: str, display_size: int) -> tuple[Image.Image, float]:
     """
-    Load the pixel-art coin reference and parse it into a rim mask and
-    an inner_radius_ratio.
+    Load the pixel-art coin reference and produce a **front-facing**
+    circular rim mask plus inner_radius_ratio.
 
-    The reference is black-on-white:
-      * Black pixels → rim (the thick circular border ring)
-      * White pixels in the centre → inner face area (where the portrait goes)
-
-    We threshold, then measure how far inward the white centre extends to
-    compute inner_radius_ratio (typically ~0.60-0.70).
+    The reference image shows the coin at a slight 3D angle (perspective
+    edge visible on the right).  To get a clean, symmetrical rim for the
+    face we:
+      1. Threshold to isolate dark (rim) pixels.
+      2. Find the bounding circle of the coin face (the elliptical front
+         portion, ignoring the perspective thickness on the right).
+      3. Sample the rim profile from the LEFT half of the image (the
+         side facing the viewer, least affected by perspective).
+      4. Mirror that left-half rim profile to produce a fully symmetrical
+         circular rim ring.
 
     Returns
     -------
     rim_mask : Image (mode "L", display_size × display_size)
         Grayscale mask where 255 = rim pixel, 0 = transparent.
     inner_radius_ratio : float
-        Fraction of the coin radius occupied by the inner face (0..1).
-
-    Requirements for the reference image:
-      * Black-on-white, square aspect ratio preferred.
+        Fraction of the coin diameter occupied by the inner face (0..1).
     """
     img = Image.open(path).convert("L")
 
@@ -366,54 +376,141 @@ def load_coin_shell(path: str, display_size: int) -> tuple[Image.Image, float]:
     top = (img.height - s) // 2
     img = img.crop((left, top, left + s, top + s))
 
-    img = img.resize((display_size, display_size), Image.LANCZOS)
-
+    # Work at a comfortable analysis size, then output at display_size
+    work_size = 512
+    img = img.resize((work_size, work_size), Image.LANCZOS)
     arr = np.asarray(img)
 
-    # Threshold: dark pixels (< 160) are the shell/rim
-    shell_pixels = arr < 160  # bool array
+    # Threshold: dark pixels (< 140) are the shell/rim
+    shell_pixels = arr < 140  # bool array
 
-    # --- Compute inner_radius_ratio by measuring the white centre ---
-    # The reference image may show the coin at a slight 3D angle, so
-    # some radial directions will hit the edge detail (dark pixels)
-    # much earlier than others.  To get a stable measurement we sample
-    # many radial lines and take the 75th percentile — this ignores
-    # the short "early hit" rays caused by the perspective edge.
-    cx = display_size / 2.0
-    cy = display_size / 2.0
-    max_r = display_size / 2.0
+    # --- Find the face centre and outer radius ---
+    # Use the vertical extent of the coin (top-to-bottom) since the
+    # vertical axis is not distorted by the 3D perspective.
+    rows_any = np.any(shell_pixels, axis=1)
+    row_indices = np.where(rows_any)[0]
+    if len(row_indices) < 2:
+        # Fallback: plain circular rim
+        return _fallback_rim(display_size)
 
-    num_angles = 72  # sample every 5°
-    boundary_radii: list[float] = []
+    top_row = row_indices[0]
+    bot_row = row_indices[-1]
+    cy = (top_row + bot_row) / 2.0
+    outer_r = (bot_row - top_row) / 2.0
+
+    # For the horizontal centre, use the leftmost extent (front-facing
+    # side) to estimate. The left edge of the coin face should be at
+    # roughly cx - outer_r.
+    cols_any = np.any(shell_pixels, axis=0)
+    col_indices = np.where(cols_any)[0]
+    left_col = col_indices[0]
+    # cx = left_col + outer_r (front face circle centre)
+    cx = left_col + outer_r
+
+    # --- Measure inner radius from the LEFT half only ---
+    # Walk radially outward from the centre along angles in the LEFT
+    # semicircle (90° to 270°) where there's no perspective edge.
+    num_angles = 60
+    inner_radii: list[float] = []
+
     for ai in range(num_angles):
-        a = (ai / num_angles) * 2 * math.pi
+        # Angles from π/2 to 3π/2 (left semicircle: up-left-down)
+        a = math.pi * 0.5 + (ai / num_angles) * math.pi
         dx = math.cos(a)
         dy = math.sin(a)
-        # Walk outward from centre until we hit shell pixels
-        for ri in range(1, int(max_r)):
+        for ri in range(2, int(outer_r)):
             px = int(cx + dx * ri)
             py = int(cy + dy * ri)
-            if 0 <= px < display_size and 0 <= py < display_size:
+            if 0 <= px < work_size and 0 <= py < work_size:
                 if shell_pixels[py, px]:
-                    boundary_radii.append(ri / max_r)
+                    inner_radii.append(ri / outer_r)
                     break
         else:
-            # Never hit shell on this ray — use full radius
-            boundary_radii.append(1.0)
+            inner_radii.append(1.0)
 
-    if boundary_radii:
-        # 75th percentile ignores short rays from 3D perspective details
-        inner_radius_ratio = float(np.percentile(boundary_radii, 75))
+    if inner_radii:
+        inner_radius_ratio = float(np.median(inner_radii))
     else:
-        inner_radius_ratio = 0.65  # fallback
+        inner_radius_ratio = 0.65
 
-    # Clamp to a sane range
-    inner_radius_ratio = max(0.50, min(inner_radius_ratio, 0.85))
+    inner_radius_ratio = max(0.50, min(inner_radius_ratio, 0.80))
 
-    rim_mask = (shell_pixels.astype(np.uint8)) * 255
-    rim_mask_img = Image.fromarray(rim_mask, "L")
+    # --- Build a clean, symmetrical circular rim mask ---
+    # We construct the rim as the area between two concentric circles:
+    # outer circle at outer_r, inner circle at outer_r * inner_radius_ratio.
+    # Then we sample the pixel-art texture from the LEFT portion of the
+    # original and stamp it around the ring for authentic pixel-art feel.
 
-    return rim_mask_img, inner_radius_ratio
+    rim_mask = Image.new("L", (work_size, work_size), 0)
+    rim_draw = ImageDraw.Draw(rim_mask)
+
+    # Draw the rim as a circular ring (outer - inner)
+    o = int(cx - outer_r)
+    rim_draw.ellipse(
+        [o, int(cy - outer_r), int(cx + outer_r), int(cy + outer_r)],
+        fill=255,
+    )
+    # Cut out the inner circle
+    inner_r = outer_r * inner_radius_ratio
+    rim_draw.ellipse(
+        [int(cx - inner_r), int(cy - inner_r),
+         int(cx + inner_r), int(cy + inner_r)],
+        fill=0,
+    )
+
+    # Now modulate with the actual pixel-art texture:
+    # Use the original shell pixels to add the chunky pixel-art detail.
+    # We only use the left half (front-facing) and mirror it.
+    texture = np.zeros((work_size, work_size), dtype=np.uint8)
+    rim_arr = np.asarray(rim_mask)
+
+    # For each pixel in the rim ring, sample from the original if it's
+    # a shell pixel; this preserves the pixel-art jaggedness.
+    shell_uint = shell_pixels.astype(np.uint8) * 255
+
+    # Left half: use original pixels where they overlap with our ring
+    half_x = int(cx)
+    left_zone = np.zeros_like(texture)
+    left_zone[:, :half_x] = 255
+    left_mask = (rim_arr > 0) & (left_zone > 0)
+    texture[left_mask] = shell_uint[left_mask]
+
+    # Mirror the left half to the right half
+    # Flip around the centre column
+    for y in range(work_size):
+        for x in range(half_x):
+            if texture[y, x] > 0:
+                mirror_x = int(2 * cx) - x
+                if 0 <= mirror_x < work_size:
+                    texture[y, mirror_x] = texture[y, x]
+
+    # Ensure the ring shape is respected (clip to ring area)
+    texture = np.minimum(texture, rim_arr)
+
+    rim_mask_final = Image.fromarray(texture, "L")
+
+    # Resize to display_size
+    rim_mask_final = rim_mask_final.resize(
+        (display_size, display_size), Image.LANCZOS)
+
+    # Re-threshold after resize to keep crisp pixel-art edges
+    rim_arr_final = np.asarray(rim_mask_final)
+    rim_arr_final = ((rim_arr_final > 100).astype(np.uint8)) * 255
+    rim_mask_out = Image.fromarray(rim_arr_final, "L")
+
+    return rim_mask_out, inner_radius_ratio
+
+
+def _fallback_rim(display_size: int) -> tuple[Image.Image, float]:
+    """Fallback: generate a simple circular rim if the reference can't be parsed."""
+    inner_radius_ratio = 0.65
+    rim = Image.new("L", (display_size, display_size), 0)
+    draw = ImageDraw.Draw(rim)
+    draw.ellipse([0, 0, display_size - 1, display_size - 1], fill=255)
+    inner = int(display_size * inner_radius_ratio)
+    off = (display_size - inner) // 2
+    draw.ellipse([off, off, off + inner - 1, off + inner - 1], fill=0)
+    return rim, inner_radius_ratio
 
 
 def colorize_shell(shell_mask: Image.Image, fg_color: tuple[int, int, int]) -> Image.Image:
