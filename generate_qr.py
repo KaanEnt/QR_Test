@@ -1,12 +1,18 @@
 """
-Animated Gooey QR Code GIF Generator (v9)
+Animated Gooey QR Code GIF Generator (v10)
 
 Reads a URL from url.txt, generates 3 visually distinct QR code variants
 (all with rounded eyes), morphs between them with a gooey transition,
 overlays a spinning 3D pixel-art-style coin with halftone portrait in
 the centre, and writes a looping animated GIF.
 
-Key changes in v9:
+Key changes in v10:
+  - Increased hold duration per color to 8000ms (doubled)
+  - Reduced morph duration to 250ms (halved)
+  - Coin now completes exactly one full rotation per complete color cycle
+  - Coin returns to starting position when loop restarts for seamless animation
+
+Previous version (v9):
   - De-perspectived coin reference: the pixel-art coin reference image is
     at a slight 3D angle.  We now extract only the front-facing circular
     rim ring from the left/front portion and mirror it to produce a clean
@@ -16,7 +22,6 @@ Key changes in v9:
       * Face disc squished by cos(angle) and composited with correct
         z-ordering
       * Pixel-art rim applied only to the face disc, not floating on top
-  - Morph/switch animation speed doubled (500ms instead of 1000ms)
   - No weird borders or artifacts on the coin
 """
 
@@ -48,9 +53,9 @@ CANVAS_SIZE = 600              # full output frame
 BORDER_PAD = 4                 # gap between outermost QR modules and border
 BORDER_WIDTH = 2               # default; overridden dynamically in main()
 
-HOLD_DURATION_MS = 4000
+HOLD_DURATION_MS = 6000        # increased hold time per color
 HOLD_SUBFRAME_MS = 80          # sub-frame interval during hold (coin spin)
-MORPH_DURATION_MS = 500
+MORPH_DURATION_MS = 500        # halved morph time for faster transition
 MORPH_FRAMES = 10
 MORPH_FRAME_MS = MORPH_DURATION_MS // MORPH_FRAMES
 
@@ -58,7 +63,11 @@ MORPH_FRAME_MS = MORPH_DURATION_MS // MORPH_FRAMES
 COIN_IMAGE_PATH = "public/event_pfp2.png"
 COIN_SHELL_PATH = "public/pixel-art-coin.jpg"   # 3D coin reference
 COIN_RATIO = 0.22              # token diameter relative to QR_SIZE
-COIN_SPIN_PERIOD_MS = 5000     # 5 seconds per full rotation (slower)
+# Spin period is derived so an exact integer number of full rotations fit
+# inside the total GIF cycle, preventing any jump/blink on loop.
+# Total cycle = 3 * (8000 + 250) = 24750ms.  24750 / 5 = 4950ms per turn
+# (~5 s, same perceived speed as the original 5000ms).
+COIN_SPIN_PERIOD_MS = 4950     # 5 full rotations per GIF loop (seamless)
 COIN_ROTATION_STEPS = 60       # pre-rendered frames in one full spin
 COIN_CLEAR_BLOCK = 16          # clearance zone block size (px)
 # Edge thickness controlled by COIN_THICKNESS_DIVISOR in the 3D section below
