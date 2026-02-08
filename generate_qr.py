@@ -122,9 +122,13 @@ def _blank_modules_from_mask(
     qr_offset: int,
 ) -> None:
     """
-    Blank (set False) every QR module whose centre falls inside the
-    clearance mask.  This guarantees the module-level erasure matches
-    the pixel-level white-out exactly -- no ragged half-blanked modules.
+    Blank (set False) every QR module that overlaps the clearance mask.
+
+    A module is blanked if *any* of its four corner pixels (in canvas
+    space) falls inside the clearance mask.  This is more aggressive
+    than a centre-only test and prevents styled drawers (rounded,
+    gapped, vertical-bar) from painting visual pixels that bleed into
+    the clearance zone even when the module centre is just outside.
 
     The clearance mask is the single source of truth for the blanked
     region geometry.  ``qr_offset`` is the pixel offset of the QR image
@@ -136,10 +140,17 @@ def _blank_modules_from_mask(
 
     for row in range(n):
         for col in range(n):
-            # Module centre in canvas pixel coordinates
-            px = int(qr_offset + (col + qr.border + 0.5) * module_px)
-            py = int(qr_offset + (row + qr.border + 0.5) * module_px)
-            if clearance_mask.getpixel((px, py)) > 0:
+            # Module bounding box corners in canvas pixel coordinates
+            x0 = int(qr_offset + (col + qr.border) * module_px)
+            y0 = int(qr_offset + (row + qr.border) * module_px)
+            x1 = int(qr_offset + (col + qr.border + 1) * module_px) - 1
+            y1 = int(qr_offset + (row + qr.border + 1) * module_px) - 1
+
+            # Blank if ANY corner of the module touches the clearance zone
+            if (clearance_mask.getpixel((x0, y0)) > 0
+                    or clearance_mask.getpixel((x1, y0)) > 0
+                    or clearance_mask.getpixel((x0, y1)) > 0
+                    or clearance_mask.getpixel((x1, y1)) > 0):
                 qr.modules[row][col] = False
 
 
