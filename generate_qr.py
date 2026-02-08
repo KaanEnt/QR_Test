@@ -116,42 +116,60 @@ def read_url() -> str:
 # QR generation with centre blank-out
 # ---------------------------------------------------------------------------
 
-def _blank_modules_from_mask(
+def _find_intruding_modules(
+    rendered: Image.Image,
     qr: qrcode.QRCode,
     clearance_mask: Image.Image,
     qr_offset: int,
-) -> None:
+) -> set[tuple[int, int]]:
     """
-    Blank (set False) every QR module that overlaps the clearance mask.
+    Inspect a rendered QR image and return the set of ``(row, col)``
+    module positions that have actual dark pixels inside the clearance
+    zone.
 
-    A module is blanked if *any* of its four corner pixels (in canvas
-    space) falls inside the clearance mask.  This is more aggressive
-    than a centre-only test and prevents styled drawers (rounded,
-    gapped, vertical-bar) from painting visual pixels that bleed into
-    the clearance zone even when the module centre is just outside.
-
-    The clearance mask is the single source of truth for the blanked
-    region geometry.  ``qr_offset`` is the pixel offset of the QR image
-    within the canvas (i.e. ``(CANVAS_SIZE - QR_SIZE) // 2``).
+    This is drawer-aware: it checks what the specific styled drawer
+    *actually* painted, not just where the logical module centre sits.
+    A module is flagged only if it contributes visible ink inside the
+    clearance area.
     """
     n = qr.modules_count
     total = n + 2 * qr.border
     module_px = QR_SIZE / total
 
+    # Convert rendered QR to a numpy bool array (True = dark ink)
+    rendered_arr = np.asarray(rendered)
+    has_ink = rendered_arr < 128
+
+    # Convert clearance mask to bool array in canvas space.  The
+    # rendered QR lives in a QR_SIZE x QR_SIZE image that gets pasted
+    # at qr_offset inside the CANVAS_SIZE canvas, so we crop the
+    # clearance mask to the QR region.
+    clear_crop = clearance_mask.crop((
+        qr_offset, qr_offset,
+        qr_offset + QR_SIZE, qr_offset + QR_SIZE,
+    ))
+    clear_arr = np.asarray(clear_crop) > 0
+
+    # Pixels that are both ink AND inside the clearance zone
+    overlap = has_ink & clear_arr
+
+    intruders: set[tuple[int, int]] = set()
     for row in range(n):
         for col in range(n):
-            # Module bounding box corners in canvas pixel coordinates
-            x0 = int(qr_offset + (col + qr.border) * module_px)
-            y0 = int(qr_offset + (row + qr.border) * module_px)
-            x1 = int(qr_offset + (col + qr.border + 1) * module_px) - 1
-            y1 = int(qr_offset + (row + qr.border + 1) * module_px) - 1
+            # Module pixel rectangle in QR-image space (includes border)
+            x0 = int((col + qr.border) * module_px)
+            y0 = int((row + qr.border) * module_px)
+            x1 = int((col + qr.border + 1) * module_px)
+            y1 = int((row + qr.border + 1) * module_px)
 
-            # Blank if ANY corner of the module touches the clearance zone
-            if (clearance_mask.getpixel((x0, y0)) > 0
-                    or clearance_mask.getpixel((x1, y0)) > 0
-                    or clearance_mask.getpixel((x0, y1)) > 0
-                    or clearance_mask.getpixel((x1, y1)) > 0):
-                qr.modules[row][col] = False
+            # Clamp to image bounds
+            x0, x1 = max(0, x0), min(QR_SIZE, x1)
+            y0, y1 = max(0, y0), min(QR_SIZE, y1)
+
+            if np.any(overlap[y0:y1, x0:x1]):
+                intruders.add((row, col))
+
+    return intruders
 
 
 def generate_qr_mask(
@@ -160,11 +178,19 @@ def generate_qr_mask(
     clearance_mask: Image.Image | None = None,
     qr_offset: int = 0,
 ) -> Image.Image:
-    """Generate a grayscale QR mask with optional centre blank-out.
+    """Generate a grayscale QR mask with per-drawer centre blank-out.
 
-    When *clearance_mask* is provided, every module whose centre falls
-    inside the mask is erased at the data level (before rendering) so that
-    the blanked region exactly matches the pixel-level clearance zone.
+    When *clearance_mask* is provided the function uses a two-pass
+    approach:
+
+    1. **Render** the QR with the styled drawer (no blanking).
+    2. **Inspect** the rendered image to find which modules actually
+       have dark pixels inside the clearance zone.
+    3. **Erase** only those modules at the data level and re-render.
+
+    This is drawer-aware -- compact drawers (e.g. ``RoundedModuleDrawer``)
+    keep more boundary modules than wide drawers (e.g. ``VerticalBarsDrawer``),
+    producing the tightest possible hole for each style.
     """
     qr = qrcode.QRCode(
         version=None,
@@ -175,10 +201,22 @@ def generate_qr_mask(
     qr.add_data(url)
     qr.make(fit=True)
 
-    # Blank centre modules BEFORE rendering so the styled drawers never
-    # paint partial modules at the boundary.
     if clearance_mask is not None:
-        _blank_modules_from_mask(qr, clearance_mask, qr_offset)
+        # --- Pass 1: render with the styled drawer, no blanking ---
+        first_pass = qr.make_image(
+            image_factory=StyledPilImage,
+            module_drawer=cfg.module_drawer,
+            eye_drawer=cfg.eye_drawer,
+        ).convert("L").resize((QR_SIZE, QR_SIZE), Image.LANCZOS)
+
+        # --- Inspect: which modules have actual ink in the clearance? ---
+        intruders = _find_intruding_modules(
+            first_pass, qr, clearance_mask, qr_offset)
+
+        # --- Erase only those modules and re-render ---
+        if intruders:
+            for row, col in intruders:
+                qr.modules[row][col] = False
 
     img = qr.make_image(
         image_factory=StyledPilImage,
