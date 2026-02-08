@@ -1,12 +1,18 @@
 """
-Animated Gooey QR Code GIF Generator (v9)
+Animated Gooey QR Code GIF Generator (v10)
 
 Reads a URL from url.txt, generates 3 visually distinct QR code variants
 (all with rounded eyes), morphs between them with a gooey transition,
 overlays a spinning 3D pixel-art-style coin with halftone portrait in
 the centre, and writes a looping animated GIF.
 
-Key changes in v9:
+Key changes in v10:
+  - Increased hold duration per color to 8000ms (doubled)
+  - Reduced morph duration to 250ms (halved)
+  - Coin now completes exactly one full rotation per complete color cycle
+  - Coin returns to starting position when loop restarts for seamless animation
+
+Previous version (v9):
   - De-perspectived coin reference: the pixel-art coin reference image is
     at a slight 3D angle.  We now extract only the front-facing circular
     rim ring from the left/front portion and mirror it to produce a clean
@@ -16,7 +22,6 @@ Key changes in v9:
       * Face disc squished by cos(angle) and composited with correct
         z-ordering
       * Pixel-art rim applied only to the face disc, not floating on top
-  - Morph/switch animation speed doubled (500ms instead of 1000ms)
   - No weird borders or artifacts on the coin
 """
 
@@ -48,23 +53,24 @@ CANVAS_SIZE = 600              # full output frame
 BORDER_PAD = 4                 # gap between outermost QR modules and border
 BORDER_WIDTH = 2               # default; overridden dynamically in main()
 
-HOLD_DURATION_MS = 4000
+HOLD_DURATION_MS = 6000        # increased hold time per color
 HOLD_SUBFRAME_MS = 80          # sub-frame interval during hold (coin spin)
-MORPH_DURATION_MS = 500
+MORPH_DURATION_MS = 500        # halved morph time for faster transition
 MORPH_FRAMES = 10
 MORPH_FRAME_MS = MORPH_DURATION_MS // MORPH_FRAMES
 
 # ---- Spinning coin token -------------------------------------------------
 COIN_IMAGE_PATH = "public/event_pfp2.png"
 COIN_SHELL_PATH = "public/pixel-art-coin.jpg"   # 3D coin reference
-COIN_RATIO = 0.34              # token diameter relative to QR_SIZE
-COIN_SPIN_PERIOD_MS = 5000     # 5 seconds per full rotation (slower)
+COIN_RATIO = 0.22              # token diameter relative to QR_SIZE
+# Spin period is derived so an exact integer number of full rotations fit
+# inside the total GIF cycle, preventing any jump/blink on loop.
+# Total cycle = 3 * (8000 + 250) = 24750ms.  24750 / 5 = 4950ms per turn
+# (~5 s, same perceived speed as the original 5000ms).
+COIN_SPIN_PERIOD_MS = 4950     # 5 full rotations per GIF loop (seamless)
 COIN_ROTATION_STEPS = 60       # pre-rendered frames in one full spin
-COIN_CLEAR_BLOCK = 20          # clearance zone block size (px)
+COIN_CLEAR_BLOCK = 16          # clearance zone block size (px)
 # Edge thickness controlled by COIN_THICKNESS_DIVISOR in the 3D section below
-
-# How many QR modules (radius) to blank in the centre for the token.
-CENTER_BLANK_EXTRA = 0         # keep tight; clearance mask handles visual padding
 
 # Halftone portrait grid
 HALFTONE_GRID = 64             # cells per side for the halftone mosaic
@@ -119,28 +125,82 @@ def read_url() -> str:
 # QR generation with centre blank-out
 # ---------------------------------------------------------------------------
 
-def _blank_center_modules(qr: qrcode.QRCode, blank_radius_modules: int) -> None:
+def _find_intruding_modules(
+    rendered: Image.Image,
+    qr: qrcode.QRCode,
+    clearance_mask: Image.Image,
+    qr_offset: int,
+) -> set[tuple[int, int]]:
     """
-    Set modules in the centre of the QR to False (white) so they are not
-    rendered. This prevents half-drawn modules around the token area.
-    The QR uses ERROR_CORRECT_H (30% redundancy) so blanking the centre
-    is safe for scanning.
+    Inspect a rendered QR image and return the set of ``(row, col)``
+    module positions that have actual dark pixels inside the clearance
+    zone.
+
+    This is drawer-aware: it checks what the specific styled drawer
+    *actually* painted, not just where the logical module centre sits.
+    A module is flagged only if it contributes visible ink inside the
+    clearance area.
     """
     n = qr.modules_count
-    cx = n / 2.0
-    cy = n / 2.0
-    r2 = blank_radius_modules ** 2
+    total = n + 2 * qr.border
+    module_px = QR_SIZE / total
 
+    # Convert rendered QR to a numpy bool array (True = dark ink)
+    rendered_arr = np.asarray(rendered)
+    has_ink = rendered_arr < 128
+
+    # Convert clearance mask to bool array in canvas space.  The
+    # rendered QR lives in a QR_SIZE x QR_SIZE image that gets pasted
+    # at qr_offset inside the CANVAS_SIZE canvas, so we crop the
+    # clearance mask to the QR region.
+    clear_crop = clearance_mask.crop((
+        qr_offset, qr_offset,
+        qr_offset + QR_SIZE, qr_offset + QR_SIZE,
+    ))
+    clear_arr = np.asarray(clear_crop) > 0
+
+    # Pixels that are both ink AND inside the clearance zone
+    overlap = has_ink & clear_arr
+
+    intruders: set[tuple[int, int]] = set()
     for row in range(n):
         for col in range(n):
-            dx = col + 0.5 - cx
-            dy = row + 0.5 - cy
-            if dx * dx + dy * dy <= r2:
-                qr.modules[row][col] = False
+            # Module pixel rectangle in QR-image space (includes border)
+            x0 = int((col + qr.border) * module_px)
+            y0 = int((row + qr.border) * module_px)
+            x1 = int((col + qr.border + 1) * module_px)
+            y1 = int((row + qr.border + 1) * module_px)
+
+            # Clamp to image bounds
+            x0, x1 = max(0, x0), min(QR_SIZE, x1)
+            y0, y1 = max(0, y0), min(QR_SIZE, y1)
+
+            if np.any(overlap[y0:y1, x0:x1]):
+                intruders.add((row, col))
+
+    return intruders
 
 
-def generate_qr_mask(url: str, cfg: VariantConfig, blank_radius_modules: int = 0) -> Image.Image:
-    """Generate a grayscale QR mask with optional centre blank-out."""
+def generate_qr_mask(
+    url: str,
+    cfg: VariantConfig,
+    clearance_mask: Image.Image | None = None,
+    qr_offset: int = 0,
+) -> Image.Image:
+    """Generate a grayscale QR mask with per-drawer centre blank-out.
+
+    When *clearance_mask* is provided the function uses a two-pass
+    approach:
+
+    1. **Render** the QR with the styled drawer (no blanking).
+    2. **Inspect** the rendered image to find which modules actually
+       have dark pixels inside the clearance zone.
+    3. **Erase** only those modules at the data level and re-render.
+
+    This is drawer-aware -- compact drawers (e.g. ``RoundedModuleDrawer``)
+    keep more boundary modules than wide drawers (e.g. ``VerticalBarsDrawer``),
+    producing the tightest possible hole for each style.
+    """
     qr = qrcode.QRCode(
         version=None,
         error_correction=qrcode.constants.ERROR_CORRECT_H,
@@ -150,9 +210,22 @@ def generate_qr_mask(url: str, cfg: VariantConfig, blank_radius_modules: int = 0
     qr.add_data(url)
     qr.make(fit=True)
 
-    # Blank centre modules BEFORE rendering
-    if blank_radius_modules > 0:
-        _blank_center_modules(qr, blank_radius_modules)
+    if clearance_mask is not None:
+        # --- Pass 1: render with the styled drawer, no blanking ---
+        first_pass = qr.make_image(
+            image_factory=StyledPilImage,
+            module_drawer=cfg.module_drawer,
+            eye_drawer=cfg.eye_drawer,
+        ).convert("L").resize((QR_SIZE, QR_SIZE), Image.LANCZOS)
+
+        # --- Inspect: which modules have actual ink in the clearance? ---
+        intruders = _find_intruding_modules(
+            first_pass, qr, clearance_mask, qr_offset)
+
+        # --- Erase only those modules and re-render ---
+        if intruders:
+            for row, col in intruders:
+                qr.modules[row][col] = False
 
     img = qr.make_image(
         image_factory=StyledPilImage,
@@ -161,29 +234,6 @@ def generate_qr_mask(url: str, cfg: VariantConfig, blank_radius_modules: int = 0
     ).convert("L")
 
     return img.resize((QR_SIZE, QR_SIZE), Image.LANCZOS)
-
-
-def compute_blank_radius(qr_version: int) -> int:
-    """
-    Compute how many modules (radius) to blank in the centre based on
-    the token size relative to the QR grid.
-    """
-    modules_count = qr_version * 4 + 17  # standard QR formula
-    border = 4  # QR spec quiet zone
-    total = modules_count + 2 * border
-
-    # Token diameter in pixels = QR_SIZE * COIN_RATIO
-    # Module size in pixels = QR_SIZE / total
-    module_px = QR_SIZE / total
-    token_diameter_px = QR_SIZE * COIN_RATIO
-    # Clearance must be tight enough to stay well under 30% erasure limit
-    # (ERROR_CORRECT_H). One block of margin is sufficient since the
-    # blocky clearance mask already adds visual padding.
-    clearance_px = COIN_CLEAR_BLOCK * 1.5
-    total_blank_diameter_px = token_diameter_px + clearance_px
-
-    blank_radius_modules = int(math.ceil(total_blank_diameter_px / (2 * module_px))) + CENTER_BLANK_EXTRA
-    return blank_radius_modules
 
 
 # ---------------------------------------------------------------------------
@@ -763,28 +813,28 @@ def get_token_frame_continuous(
 
 def make_blocky_clearance_mask(
     canvas_size: int,
-    token_display: int,
+    radius_px: int,
     block: int,
 ) -> Image.Image:
     """
     Build a mask with a blocky (pixelated) circular hole in the centre.
     The hole is built from square blocks so it looks like part of the QR grid,
     not a smooth circle.
+
+    ``radius_px`` is the pixel radius of the zone to blank (should match or
+    slightly exceed the module-level blank radius so no ragged modules show).
     """
     mask = Image.new("L", (canvas_size, canvas_size), 0)
 
     cx = canvas_size // 2
     cy = canvas_size // 2
-    # Radius: token + 1 block of margin (tight to avoid covering
-    # alignment patterns that sit near the centre)
-    radius = token_display // 2 + block
 
     for bx in range(0, canvas_size, block):
         for by in range(0, canvas_size, block):
             bcx = bx + block // 2
             bcy = by + block // 2
             dist = math.sqrt((bcx - cx) ** 2 + (bcy - cy) ** 2)
-            if dist < radius:
+            if dist < radius_px:
                 mask.paste(255, (bx, by, min(bx + block, canvas_size),
                                  min(by + block, canvas_size)))
 
@@ -849,12 +899,17 @@ def assemble_gif(
     rim_mask: Image.Image,
     inner_radius_ratio: float,
     border_width: int,
+    clearance: Image.Image | None = None,
 ) -> None:
     n = len(masks)
     token_display = int(QR_SIZE * COIN_RATIO)
 
-    # Build blocky clearance mask (same geometry for all frames)
-    clearance = make_blocky_clearance_mask(CANVAS_SIZE, token_display, COIN_CLEAR_BLOCK)
+    # Use the pre-built clearance mask if provided; otherwise build one
+    # (fallback keeps the function self-contained for any future callers).
+    if clearance is None:
+        clearance_radius = token_display // 2 + COIN_CLEAR_BLOCK
+        clearance = make_blocky_clearance_mask(
+            CANVAS_SIZE, clearance_radius, COIN_CLEAR_BLOCK)
 
     # Pre-build 3D coin rotation frames for each variant colour
     print("  Pre-rendering 3D coin rotations per variant ...")
@@ -891,7 +946,7 @@ def assemble_gif(
         print(f"  Morph {i+1} -> {ni+1} ...")
 
         for fi in range(1, MORPH_FRAMES + 1):
-            t = fi / (MORPH_FRAMES + 1)
+            t = fi / MORPH_FRAMES
             m_mask = gooey_morph_mask(masks[i], masks[ni], t)
             fg = lerp_color(configs[i].front_color, configs[ni].front_color, t)
             f = compose_frame(m_mask, fg, border_width)
@@ -944,8 +999,7 @@ def main() -> None:
     print(f"  Rim mask loaded at {rim_mask.size[0]}x{rim_mask.size[1]}")
     print(f"  Inner radius ratio: {inner_radius_ratio:.3f}\n")
 
-    # Determine QR version first so we can compute centre blank radius
-    # and derive the dynamic border width.
+    # Determine QR version to derive the dynamic border width.
     print("Determining QR version ...")
     probe = qrcode.QRCode(
         error_correction=qrcode.constants.ERROR_CORRECT_H,
@@ -954,7 +1008,6 @@ def main() -> None:
     probe.add_data(url)
     probe.make(fit=True)
     qr_version = probe.version
-    blank_radius = compute_blank_radius(qr_version)
 
     # Dynamic border width: match the finder-pattern eye ring thickness.
     # The eye outer ring is nominally 1 module, but the rounded drawer
@@ -965,8 +1018,17 @@ def main() -> None:
     border_width = max(2, min(int(round(module_px * 0.65)), max_border))
 
     print(f"  QR version {qr_version} ({probe.modules_count}x{probe.modules_count})")
-    print(f"  Centre blank radius: {blank_radius} modules")
     print(f"  Border width: {border_width}px (~0.65 module = {module_px:.1f}px)\n")
+
+    # Build the blocky clearance mask ONCE, before QR generation.
+    # This single mask drives both module-level blanking (data erasure)
+    # and the pixel-level white-out at compositing time.
+    qr_offset = (CANVAS_SIZE - QR_SIZE) // 2
+    clearance_radius = token_display // 2 + COIN_CLEAR_BLOCK
+    clearance_mask = make_blocky_clearance_mask(
+        CANVAS_SIZE, clearance_radius, COIN_CLEAR_BLOCK)
+    print(f"  Clearance mask: radius {clearance_radius}px, "
+          f"block {COIN_CLEAR_BLOCK}px\n")
 
     print("Generating QR variants (with centre blank-out) ...")
     masks: list[Image.Image] = []
@@ -974,11 +1036,12 @@ def main() -> None:
         print(f"  [{i+1}/{len(VARIANTS)}] {cfg.name}  "
               f"(modules={cfg.module_drawer.__class__.__name__}, "
               f"color={cfg.front_color})")
-        masks.append(generate_qr_mask(url, cfg, blank_radius_modules=blank_radius))
+        masks.append(generate_qr_mask(url, cfg, clearance_mask, qr_offset))
     print()
 
     print("Assembling GIF ...")
-    assemble_gif(masks, VARIANTS, brightness, rim_mask, inner_radius_ratio, border_width)
+    assemble_gif(masks, VARIANTS, brightness, rim_mask, inner_radius_ratio,
+                 border_width, clearance_mask)
 
     total_ms = len(VARIANTS) * (HOLD_DURATION_MS + MORPH_DURATION_MS)
     nframes = len(VARIANTS) * (HOLD_DURATION_MS // HOLD_SUBFRAME_MS + MORPH_FRAMES)
