@@ -259,17 +259,26 @@ def compose_frame(
     offset = (CANVAS_SIZE - QR_SIZE) // 2
     base.paste(qr, (offset, offset), qr)
 
-    # Border sits outside the QR area. Pillow draws the stroke centred
-    # on the rectangle coords, so we push it outward by half the width
-    # to guarantee it never overlaps QR modules.
-    draw = ImageDraw.Draw(base)
-    half_bw = border_width / 2
-    b = offset - BORDER_PAD - half_bw
-    draw.rectangle(
-        [b, b, CANVAS_SIZE - b - 1, CANVAS_SIZE - b - 1],
-        outline=(*fg, 255),
-        width=border_width,
+    # Border: outer edge flush with the canvas (square corners), inner
+    # edge rounded.  Built as a separate RGBA layer where only the border
+    # band is opaque, then composited on top of the base.
+    border_layer = Image.new("RGBA", (CANVAS_SIZE, CANVAS_SIZE), (0, 0, 0, 0))
+    bw = border_width
+    # 1) Fill entire canvas with border colour
+    ImageDraw.Draw(border_layer).rectangle(
+        [0, 0, CANVAS_SIZE - 1, CANVAS_SIZE - 1],
+        fill=(*fg, 255),
     )
+    # 2) Punch out the interior with a rounded rect (transparent hole)
+    inner_mask = Image.new("L", (CANVAS_SIZE, CANVAS_SIZE), 255)
+    ImageDraw.Draw(inner_mask).rounded_rectangle(
+        [bw, bw, CANVAS_SIZE - bw - 1, CANVAS_SIZE - bw - 1],
+        radius=int(round(bw * 1.5)),
+        fill=0,
+    )
+    border_layer.putalpha(inner_mask)
+    # 3) Paste the border on top of the QR content
+    base = Image.alpha_composite(base, border_layer)
     return base
 
 
@@ -796,15 +805,15 @@ def main() -> None:
     qr_version = probe.version
 
     # Dynamic border width: match the finder-pattern eye ring thickness.
-    # The eye outer ring is nominally 1 module, but the rounded drawer
-    # anti-aliases it so visually it looks ~60-70% of a raw module.
+    # The eye outer ring is exactly 1 module wide, so we use the full
+    # module pixel size for the border.
     modules_with_border = probe.modules_count + 2 * probe.border
     module_px = QR_SIZE / modules_with_border
     max_border = (CANVAS_SIZE - QR_SIZE) // 2
-    border_width = max(2, min(int(round(module_px * 0.65)), max_border))
+    border_width = max(2, min(int(round(module_px)), max_border))
 
     print(f"  QR version {qr_version} ({probe.modules_count}x{probe.modules_count})")
-    print(f"  Border width: {border_width}px (~0.65 module = {module_px:.1f}px)\n")
+    print(f"  Border width: {border_width}px (~1 module = {module_px:.1f}px)\n")
 
     # Build the blocky clearance mask ONCE, before QR generation.
     # This single mask drives both module-level blanking (data erasure)
