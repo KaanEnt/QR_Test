@@ -518,19 +518,38 @@ def render_coin_frame_pillow(
                 face_resized,
             )
         else:
-            # Back of the coin — lighter solid colour disc for contrast
-            face_resized = Image.new(
+            # Back of the coin — border ring + lighter inner disc
+            border_px = max(2, int(coin_diam * 0.04))
+
+            # Draw border ring first (full coin disc in edge_color)
+            border_ring = Image.new(
                 "RGBA", (face_width, face_height), (0, 0, 0, 0),
             )
-            ImageDraw.Draw(face_resized).ellipse(
+            ImageDraw.Draw(border_ring).ellipse(
                 [0, 0, face_width - 1, face_height - 1],
+                fill=edge_color + (255,),
+            )
+            canvas.paste(
+                border_ring,
+                (cx - face_width // 2, cy - face_height // 2),
+                border_ring,
+            )
+
+            # Then draw lighter back disc inset by border_px
+            inner_w = max(1, face_width - border_px * 2)
+            inner_h = max(1, face_height - border_px * 2)
+            back_disc = Image.new(
+                "RGBA", (inner_w, inner_h), (0, 0, 0, 0),
+            )
+            ImageDraw.Draw(back_disc).ellipse(
+                [0, 0, inner_w - 1, inner_h - 1],
                 fill=back_color + (255,),
             )
 
             canvas.paste(
-                face_resized,
-                (cx - face_width // 2, cy - face_height // 2),
-                face_resized,
+                back_disc,
+                (cx - inner_w // 2, cy - inner_h // 2),
+                back_disc,
             )
 
     # --- Lighting overlay for metallic sheen ---
