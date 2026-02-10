@@ -445,6 +445,9 @@ def render_coin_frame_pillow(
     """
     canvas = Image.new("RGBA", (display_size, display_size), (0, 0, 0, 0))
 
+    # Lighter back face: blend edge_color 40% toward white for contrast
+    back_color = tuple(c + (255 - c) * 2 // 5 for c in edge_color)
+
     # How much of the face is visible: cos(angle) ranges from -1 to 1.
     cos_a = math.cos(angle)
     face_visible = cos_a > 0
@@ -483,25 +486,52 @@ def render_coin_frame_pillow(
     # --- Draw the face (or back) ---
     if face_width >= 2:
         if face_visible:
+            # Calculate border width (~4% of coin diameter, minimum 2 px)
+            border_px = max(2, int(coin_diam * 0.04))
+
+            # Draw border ring first (full coin disc in edge_color)
+            border_ring = Image.new(
+                "RGBA", (face_width, face_height), (0, 0, 0, 0),
+            )
+            ImageDraw.Draw(border_ring).ellipse(
+                [0, 0, face_width - 1, face_height - 1],
+                fill=edge_color + (255,),
+            )
+            canvas.paste(
+                border_ring,
+                (cx - face_width // 2, cy - face_height // 2),
+                border_ring,
+            )
+
+            # Then paste face texture inset by border_px on each side
+            inner_w = max(1, face_width - border_px * 2)
+            inner_h = max(1, face_height - border_px * 2)
             face_resized = face_texture.resize(
-                (face_width, face_height), Image.LANCZOS,
+                (inner_w, inner_h), Image.LANCZOS,
             )
             face_resized = _apply_ellipse_mask(face_resized)
+
+            # Paste centred on top of the border ring
+            canvas.paste(
+                face_resized,
+                (cx - inner_w // 2, cy - inner_h // 2),
+                face_resized,
+            )
         else:
-            # Back of the coin — solid colour disc
+            # Back of the coin — lighter solid colour disc for contrast
             face_resized = Image.new(
                 "RGBA", (face_width, face_height), (0, 0, 0, 0),
             )
             ImageDraw.Draw(face_resized).ellipse(
                 [0, 0, face_width - 1, face_height - 1],
-                fill=edge_color + (255,),
+                fill=back_color + (255,),
             )
 
-        canvas.paste(
-            face_resized,
-            (cx - face_width // 2, cy - face_height // 2),
-            face_resized,
-        )
+            canvas.paste(
+                face_resized,
+                (cx - face_width // 2, cy - face_height // 2),
+                face_resized,
+            )
 
     # --- Lighting overlay for metallic sheen ---
     lighting = _make_lighting_overlay(display_size)
