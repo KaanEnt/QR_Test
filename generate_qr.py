@@ -468,87 +468,48 @@ def render_coin_frame_pillow(
 
     cx, cy = display_size // 2, display_size // 2
 
-    # --- Draw edge strip behind the face ---
-    edge_extra = edge_thickness if h_scale < 0.97 else 0
-    if edge_extra > 0:
-        edge_w = face_width + edge_extra * 2
-        edge_img = Image.new("RGBA", (edge_w, face_height), (0, 0, 0, 0))
-        ImageDraw.Draw(edge_img).ellipse(
-            [0, 0, edge_w - 1, face_height - 1],
-            fill=edge_color + (255,),
-        )
-        canvas.paste(
-            edge_img,
-            (cx - edge_w // 2, cy - face_height // 2),
-            edge_img,
-        )
+    # --- Draw rim (edge strip + border ring as one piece) ---
+    # The rim is always edge_thickness pixels wider than the face on each side
+    # horizontally, and edge_thickness pixels taller top/bottom.  Because it's
+    # drawn *behind* the face content, the visible border is the part that peeks
+    # out around the edges — no inset math, no rounding jumps.
+    rim_w = face_width + edge_thickness * 2
+    rim_h = face_height + edge_thickness * 2
+    rim_img = Image.new("RGBA", (rim_w, rim_h), (0, 0, 0, 0))
+    ImageDraw.Draw(rim_img).ellipse(
+        [0, 0, rim_w - 1, rim_h - 1],
+        fill=edge_color + (255,),
+    )
+    canvas.paste(
+        rim_img,
+        (cx - rim_w // 2, cy - rim_h // 2),
+        rim_img,
+    )
 
-    # --- Draw the face (or back) ---
+    # --- Draw the face (or back) on top of the rim ---
     if face_width >= 2:
         if face_visible:
-            # Calculate border width (~4% of coin diameter, minimum 2 px)
-            border_px = max(2, int(coin_diam * 0.04))
-
-            # Draw border ring first (full coin disc in edge_color)
-            border_ring = Image.new(
-                "RGBA", (face_width, face_height), (0, 0, 0, 0),
-            )
-            ImageDraw.Draw(border_ring).ellipse(
-                [0, 0, face_width - 1, face_height - 1],
-                fill=edge_color + (255,),
-            )
-            canvas.paste(
-                border_ring,
-                (cx - face_width // 2, cy - face_height // 2),
-                border_ring,
-            )
-
-            # Then paste face texture inset by border_px on each side
-            inner_w = max(1, face_width - border_px * 2)
-            inner_h = max(1, face_height - border_px * 2)
             face_resized = face_texture.resize(
-                (inner_w, inner_h), Image.LANCZOS,
+                (face_width, face_height), Image.LANCZOS,
             )
             face_resized = _apply_ellipse_mask(face_resized)
-
-            # Paste centred on top of the border ring
             canvas.paste(
                 face_resized,
-                (cx - inner_w // 2, cy - inner_h // 2),
+                (cx - face_width // 2, cy - face_height // 2),
                 face_resized,
             )
         else:
-            # Back of the coin — border ring + lighter inner disc
-            border_px = max(2, int(coin_diam * 0.04))
-
-            # Draw border ring first (full coin disc in edge_color)
-            border_ring = Image.new(
+            # Back of the coin — lighter disc on top of the rim
+            back_disc = Image.new(
                 "RGBA", (face_width, face_height), (0, 0, 0, 0),
             )
-            ImageDraw.Draw(border_ring).ellipse(
-                [0, 0, face_width - 1, face_height - 1],
-                fill=edge_color + (255,),
-            )
-            canvas.paste(
-                border_ring,
-                (cx - face_width // 2, cy - face_height // 2),
-                border_ring,
-            )
-
-            # Then draw lighter back disc inset by border_px
-            inner_w = max(1, face_width - border_px * 2)
-            inner_h = max(1, face_height - border_px * 2)
-            back_disc = Image.new(
-                "RGBA", (inner_w, inner_h), (0, 0, 0, 0),
-            )
             ImageDraw.Draw(back_disc).ellipse(
-                [0, 0, inner_w - 1, inner_h - 1],
+                [0, 0, face_width - 1, face_height - 1],
                 fill=back_color + (255,),
             )
-
             canvas.paste(
                 back_disc,
-                (cx - inner_w // 2, cy - inner_h // 2),
+                (cx - face_width // 2, cy - face_height // 2),
                 back_disc,
             )
 
