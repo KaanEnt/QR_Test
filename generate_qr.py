@@ -433,7 +433,6 @@ def render_coin_frame_pillow(
     face_texture: Image.Image,
     display_size: int,
     edge_color: tuple[int, int, int],
-    border_thickness: int = 0,
 ) -> Image.Image:
     """
     Render a single frame of a spinning coin using Pillow transforms.
@@ -448,9 +447,6 @@ def render_coin_frame_pillow(
         Output image width and height in pixels (square).
     edge_color : tuple
         RGB colour for the coin edge strip.
-    border_thickness : int
-        When > 0, use this as the coin ring thickness (to match the
-        outer QR border).  When 0, fall back to 6% of coin diameter.
 
     Returns
     -------
@@ -472,9 +468,8 @@ def render_coin_frame_pillow(
     coin_diam = int(display_size * 0.90)
     coin_radius = coin_diam // 2
 
-    # Edge thickness — matches the outer QR border when provided,
-    # otherwise falls back to 6% of the coin diameter.
-    edge_thickness = border_thickness if border_thickness > 0 else max(2, int(coin_diam * 0.06))
+    # Edge thickness (visible when coin is near-edge-on)
+    edge_thickness = max(2, int(coin_diam * 0.06))
 
     # Scaled width of the face ellipse
     face_width = max(1, int(coin_diam * h_scale))
@@ -482,48 +477,48 @@ def render_coin_frame_pillow(
 
     cx, cy = display_size // 2, display_size // 2
 
-    # --- Draw the full coin disc (rim) at the original size ---
-    # The rim fills the entire face_width x face_height ellipse.
-    rim_img = Image.new("RGBA", (face_width, face_height), (0, 0, 0, 0))
+    # --- Draw rim (edge strip + border ring as one piece) ---
+    # The rim is always edge_thickness pixels wider than the face on each side
+    # horizontally, and edge_thickness pixels taller top/bottom.  Because it's
+    # drawn *behind* the face content, the visible border is the part that peeks
+    # out around the edges — no inset math, no rounding jumps.
+    rim_w = face_width + edge_thickness * 2
+    rim_h = face_height + edge_thickness * 2
+    rim_img = Image.new("RGBA", (rim_w, rim_h), (0, 0, 0, 0))
     ImageDraw.Draw(rim_img).ellipse(
-        [0, 0, face_width - 1, face_height - 1],
+        [0, 0, rim_w - 1, rim_h - 1],
         fill=edge_color + (255,),
     )
     canvas.paste(
         rim_img,
-        (cx - face_width // 2, cy - face_height // 2),
+        (cx - rim_w // 2, cy - rim_h // 2),
         rim_img,
     )
 
-    # --- Draw the face (or back) inset by edge_thickness inside the rim ---
-    # The border ring is visible as the gap between the outer rim and the
-    # smaller inner disc / texture.  Coin stays the same overall size.
-    inner_w = max(1, face_width - edge_thickness * 2)
-    inner_h = max(1, face_height - edge_thickness * 2)
-
-    if inner_w >= 2:
+    # --- Draw the face (or back) on top of the rim ---
+    if face_width >= 2:
         if face_visible:
             face_resized = face_texture.resize(
-                (inner_w, inner_h), Image.LANCZOS,
+                (face_width, face_height), Image.LANCZOS,
             )
             face_resized = _apply_ellipse_mask(face_resized)
             canvas.paste(
                 face_resized,
-                (cx - inner_w // 2, cy - inner_h // 2),
+                (cx - face_width // 2, cy - face_height // 2),
                 face_resized,
             )
         else:
-            # Back of the coin — lighter disc inset inside the rim
+            # Back of the coin — lighter disc on top of the rim
             back_disc = Image.new(
-                "RGBA", (inner_w, inner_h), (0, 0, 0, 0),
+                "RGBA", (face_width, face_height), (0, 0, 0, 0),
             )
             ImageDraw.Draw(back_disc).ellipse(
-                [0, 0, inner_w - 1, inner_h - 1],
+                [0, 0, face_width - 1, face_height - 1],
                 fill=back_color + (255,),
             )
             canvas.paste(
                 back_disc,
-                (cx - inner_w // 2, cy - inner_h // 2),
+                (cx - face_width // 2, cy - face_height // 2),
                 back_disc,
             )
 
@@ -552,7 +547,6 @@ def build_3d_coin_frames_trimesh(
     brightness: np.ndarray,
     display_size: int,
     fg_color: tuple[int, int, int],
-    border_thickness: int = 0,
 ) -> list[Image.Image]:
     """
     Pre-render all rotation frames of the spinning coin with halftone mosaic.
@@ -567,8 +561,6 @@ def build_3d_coin_frames_trimesh(
         Output frame size in pixels (square).
     fg_color : tuple
         Foreground colour for the halftone dots and coin edge.
-    border_thickness : int
-        Coin ring thickness (passed through to render_coin_frame_pillow).
 
     Returns
     -------
@@ -589,7 +581,7 @@ def build_3d_coin_frames_trimesh(
     for step in range(COIN_ROTATION_STEPS):
         angle = (2.0 * math.pi * step) / COIN_ROTATION_STEPS
         frame = render_coin_frame_pillow(
-            angle, halftone_texture, display_size, fg_color, border_thickness,
+            angle, halftone_texture, display_size, fg_color,
         )
         frames.append(frame)
     return frames
@@ -726,7 +718,7 @@ def assemble_gif(
     token_frame_sets: list[list[Image.Image]] = []
     for i, cfg in enumerate(configs):
         tfs = build_3d_coin_frames_trimesh(
-            brightness, token_display, cfg.front_color, border_width,
+            brightness, token_display, cfg.front_color,
         )
         token_frame_sets.append(tfs)
         direction = "CW" if (i % 2 == 0) else "CCW"
