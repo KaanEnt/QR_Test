@@ -81,22 +81,22 @@ class VariantConfig:
 
 VARIANTS: list[VariantConfig] = [
     VariantConfig(
-        name="Pompeian Red Rounded",
+        name="Charcoal Rounded",
         module_drawer=RoundedModuleDrawer(),
         eye_drawer=RoundedModuleDrawer(),
-        front_color=(164, 41, 46),      # Pompeian Red 18-1658 TCX  #A4292E
+        front_color=(24, 24, 26),       # #18181A
     ),
     VariantConfig(
-        name="Green Gapped",
+        name="Slate Gapped",
         module_drawer=GappedSquareModuleDrawer(),
         eye_drawer=RoundedModuleDrawer(),
-        front_color=(0, 150, 57),       # Green 347 C  #009639
+        front_color=(115, 122, 130),    # #737A82
     ),
     VariantConfig(
-        name="Diode Blue Bars",
+        name="Gunmetal Bars",
         module_drawer=VerticalBarsDrawer(),
         eye_drawer=RoundedModuleDrawer(),
-        front_color=(0, 69, 172),       # Diode Blue 20-0147 TPM  #0045AC
+        front_color=(39, 44, 45),       # #272C2D
     ),
 ]
 
