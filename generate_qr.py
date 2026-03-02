@@ -54,7 +54,7 @@ MORPH_FRAMES = 10
 MORPH_FRAME_MS = MORPH_DURATION_MS // MORPH_FRAMES
 
 # ---- Spinning coin token -------------------------------------------------
-COIN_IMAGE_PATH = "public/event_pfp2.png"
+COIN_IMAGE_PATH = "public/linkedin.png"
 COIN_RATIO = 0.22              # token diameter relative to QR_SIZE
 # Spin period is derived so an exact integer number of full rotations fit
 # inside the total GIF cycle, preventing any jump/blink on loop.
@@ -81,22 +81,22 @@ class VariantConfig:
 
 VARIANTS: list[VariantConfig] = [
     VariantConfig(
-        name="Charcoal Rounded",
+        name="LinkedIn Blue Rounded",
         module_drawer=RoundedModuleDrawer(),
         eye_drawer=RoundedModuleDrawer(),
-        front_color=(24, 24, 26),       # #18181A
+        front_color=(0, 69, 172),       # #0045AC
     ),
     VariantConfig(
-        name="Slate Gapped",
+        name="Deep Teal Gapped",
         module_drawer=GappedSquareModuleDrawer(),
         eye_drawer=RoundedModuleDrawer(),
-        front_color=(115, 122, 130),    # #737A82
+        front_color=(0, 90, 146),       # #005A92
     ),
     VariantConfig(
-        name="Gunmetal Bars",
+        name="Indigo Bars",
         module_drawer=VerticalBarsDrawer(),
         eye_drawer=RoundedModuleDrawer(),
-        front_color=(39, 44, 45),       # #272C2D
+        front_color=(34, 52, 116),      # #223474
     ),
 ]
 
